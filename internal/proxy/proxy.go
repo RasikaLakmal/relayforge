@@ -1,27 +1,32 @@
 // Package proxy implements request/response level forwarding: read one
-// HTTP/1.1 request off the client connection at a time, forward it to a
-// backend as its own message, and write back the matching response. A TCP
-// connection can carry many requests; this is what gives each of them its
-// own boundary, which per-request routing, retries, and metrics need in
-// later milestones and a raw byte pipe cannot provide.
+// HTTP/1.1 request off the client connection at a time, round-robin to
+// pick a backend, forward the request to it as its own message, and write
+// back the matching response. A TCP connection can carry many requests;
+// this is what gives each of them its own boundary, which per-request
+// routing, retries, and metrics need and a raw byte pipe cannot provide.
 package proxy
 
 import (
 	"bufio"
+	"errors"
 	"log"
 	"net"
 	"net/http"
+	"sync/atomic"
 )
 
-// Server forwards every accepted connection to a single fixed backend
-// address. It has no routing or health checks yet, and no connection
-// pooling: each client connection gets its own backend connection, and if
-// the backend closes it, the client connection closes too rather than
-// being kept alive against a fresh backend dial. Those come in later
-// milestones.
+// Server forwards every request to one of Backends, chosen in round-robin
+// order. There is no health awareness yet: a backend that is down gets
+// picked like any other, and the request routed to it simply fails. There
+// is no connection pooling yet either: every request dials its own fresh
+// backend connection rather than reusing one, which is also what makes
+// picking a different backend for each request on the same client
+// connection possible in the first place.
 type Server struct {
 	ListenAddr string
-	Backend    string
+	Backends   []string
+
+	next uint64
 }
 
 // ListenAndServe opens ListenAddr and serves it until Accept fails.
@@ -39,7 +44,11 @@ func (s *Server) ListenAndServe() error {
 func (s *Server) Serve(ln net.Listener) error {
 	defer ln.Close()
 
-	log.Printf("relayforge: listening on %s, forwarding to %s", ln.Addr(), s.Backend)
+	if len(s.Backends) == 0 {
+		return errors.New("relayforge: at least one backend is required")
+	}
+
+	log.Printf("relayforge: listening on %s, backends=%v (round robin)", ln.Addr(), s.Backends)
 
 	for {
 		conn, err := ln.Accept()
@@ -50,45 +59,48 @@ func (s *Server) Serve(ln net.Listener) error {
 	}
 }
 
-// handleConn dials the backend once for this client connection, then keeps
-// forwarding requests off it until either side ends the connection.
+// nextBackend picks the next backend address in round-robin order.
+func (s *Server) nextBackend() string {
+	n := atomic.AddUint64(&s.next, 1)
+	return s.Backends[(n-1)%uint64(len(s.Backends))]
+}
+
 func (s *Server) handleConn(client net.Conn) {
 	defer client.Close()
 
-	backend, err := net.Dial("tcp", s.Backend)
-	if err != nil {
-		log.Printf("relayforge: dial backend %s failed: %v", s.Backend, err)
-		return
-	}
-	defer backend.Close()
-
 	clientReader := bufio.NewReader(client)
-	backendReader := bufio.NewReader(backend)
-
-	for s.forwardOneRequest(client, clientReader, backend, backendReader) {
+	for s.forwardOneRequest(client, clientReader) {
 	}
 }
 
-// forwardOneRequest reads one HTTP request off the client, forwards it to
-// the backend, and writes back the matching response. It reports whether
-// the same connection should be used for another request: both request and
-// response framing (Connection: close, HTTP/1.0 with no keep-alive) can end
-// the connection, and a malformed or partial request is rejected outright
-// rather than left hanging.
-func (s *Server) forwardOneRequest(client net.Conn, clientReader *bufio.Reader, backend net.Conn, backendReader *bufio.Reader) bool {
+// forwardOneRequest reads one HTTP request off the client, round-robins to
+// pick a backend, dials a fresh connection to it for this request alone,
+// and writes back the response. It reports whether the client connection
+// should be used for another request: request/response close framing
+// (Connection: close, HTTP/1.0 with no keep-alive), a failed backend dial,
+// and a malformed or partial request all end it.
+func (s *Server) forwardOneRequest(client net.Conn, clientReader *bufio.Reader) bool {
 	req, err := http.ReadRequest(clientReader)
 	if err != nil {
 		return false
 	}
 
+	backendAddr := s.nextBackend()
+	backend, err := net.Dial("tcp", backendAddr)
+	if err != nil {
+		log.Printf("relayforge: dial backend %s failed: %v", backendAddr, err)
+		return false
+	}
+	defer backend.Close()
+
 	if err := req.Write(backend); err != nil {
-		log.Printf("relayforge: write to backend failed: %v", err)
+		log.Printf("relayforge: write to backend %s failed: %v", backendAddr, err)
 		return false
 	}
 
-	resp, err := http.ReadResponse(backendReader, req)
+	resp, err := http.ReadResponse(bufio.NewReader(backend), req)
 	if err != nil {
-		log.Printf("relayforge: read from backend failed: %v", err)
+		log.Printf("relayforge: read from backend %s failed: %v", backendAddr, err)
 		return false
 	}
 	defer resp.Body.Close()
@@ -98,9 +110,5 @@ func (s *Server) forwardOneRequest(client net.Conn, clientReader *bufio.Reader, 
 		return false
 	}
 
-	// If the backend closed on us, the connection this client has can't
-	// be reused for its next request either: there is no pooling yet to
-	// dial a fresh backend connection mid-stream, so the whole thing ends
-	// here even if the client itself asked to keep it alive.
 	return !req.Close && !resp.Close
 }

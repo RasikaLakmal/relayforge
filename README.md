@@ -6,23 +6,25 @@ Part of a personal [engineering lab](../../checklist.md) of systems-depth projec
 
 ## What's here
 
-- **Request/response forwarding**: each client connection is dialed through to a single fixed backend, then read and forwarded one HTTP/1.1 request at a time rather than as a blind byte copy, so there is a clear boundary around each request instead of just a stream of bytes.
+- **Request/response forwarding**: each HTTP/1.1 request is read off the client connection, forwarded to a backend as its own message, and matched with its response, rather than the connection being treated as a blind byte stream.
 - **Framing-aware**: `Content-Length`, chunked encoding, and `Connection: close` are parsed with `net/http`'s `http.ReadRequest`/`http.ReadResponse`, not reimplemented by hand.
 - **Persistent connections**: a single TCP connection can carry many HTTP requests in sequence, gated by the connection's own close framing rather than the proxy assuming one request per connection.
+- **Multiple backends, round robin**: backend selection happens per request, not per connection, so a client's persistent connection is not pinned to one backend, its requests still get distributed round robin across all configured backends.
 
 ## Usage
 
 ```
 go build -o relayforge ./cmd/relayforge
-./relayforge -listen 127.0.0.1:8080 -backend 127.0.0.1:9090
+./relayforge -listen 127.0.0.1:8080 -backends 127.0.0.1:9090,127.0.0.1:9091
 ```
 
-Every connection to `-listen` is forwarded to `-backend`. There is no routing or load balancing yet, one proxy instance talks to exactly one backend.
+Every request is forwarded to one of `-backends`, chosen round robin, one at a time regardless of how many backends are listed.
 
 ## Known limitations
 
-- Single fixed backend, no config file, no multiple backends, no load balancing yet.
-- No connection pooling yet: each client connection dials its own backend connection, and if the backend closes it, the client connection is closed too even if the client asked to keep it alive.
+- No config file yet, backends are a flag-supplied comma-separated list.
+- No health checks yet: a dead backend is picked in its turn like any other, and the request routed to it simply fails, taking the whole client connection down with it since there is no fallback to another backend mid-request.
+- No connection pooling yet: every request dials its own fresh backend connection rather than reusing one.
 - Hop-by-hop headers (`Connection`, `Keep-Alive`, `TE`, `Trailer`, etc.) are forwarded to the backend as-is rather than being stripped per RFC 7230 6.1. Harmless for the backends tested against so far, but not strictly correct proxy behavior.
 - `Request.Write` always emits the request line as HTTP/1.1 regardless of what the client actually sent, so an HTTP/1.0 request is silently upgraded on the wire to the backend.
 - `go test -race` could not be run in this environment: no C compiler is installed, and the race detector requires cgo. Tests were run and pass under plain `go test ./...`; race detection should be run wherever a C toolchain is available before trusting concurrency-sensitive work (connection pooling, health state, retry counters) at face value.
@@ -33,4 +35,4 @@ Every connection to `-listen` is forwarded to `-backend`. There is no routing or
 go test ./...
 ```
 
-Covers: a single request/response round trip through the proxy, a chunked response body reassembled correctly, two requests carried over one persistent connection, a connection torn down after a `Connection: close` response, a malformed request rejected cleanly instead of hanging the proxy, and the client connection closed cleanly when the backend dial fails.
+Covers: a single request/response round trip through the proxy, a chunked response body reassembled correctly, two requests carried over one persistent connection, a connection torn down after a `Connection: close` response, a malformed request rejected cleanly instead of hanging the proxy, the client connection closed cleanly when a backend dial fails, requests round-robining across backends in the correct order over a single persistent connection, and a dead backend failing only the requests routed to it.

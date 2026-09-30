@@ -1,27 +1,26 @@
-// Command relayforge is a TCP reverse proxy. This is the milestone-0
-// skeleton: one listen address, one fixed backend, no HTTP awareness, no
-// routing. Everything else in the project builds on top of it.
+// Command relayforge is an HTTP/1.1 reverse proxy and load balancer.
 package main
 
 import (
 	"flag"
 	"log"
+	"strings"
 
 	"github.com/RasikaLakmal/relayforge/internal/proxy"
 )
 
 func main() {
 	listenAddr := flag.String("listen", ":8080", "address to listen on")
-	backendAddr := flag.String("backend", "", "backend address to forward every connection to")
+	backendsFlag := flag.String("backends", "", "comma-separated list of backend addresses to round-robin across")
 	flag.Parse()
 
-	if *backendAddr == "" {
-		log.Fatal("relayforge: -backend is required")
+	if *backendsFlag == "" {
+		log.Fatal("relayforge: -backends is required")
 	}
 
 	srv := &proxy.Server{
 		ListenAddr: *listenAddr,
-		Backend:    *backendAddr,
+		Backends:   strings.Split(*backendsFlag, ","),
 	}
 
 	if err := srv.ListenAndServe(); err != nil {
