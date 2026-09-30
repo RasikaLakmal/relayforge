@@ -1,8 +1,10 @@
 package proxy
 
 import (
+	"bufio"
 	"io"
 	"net"
+	"net/http"
 	"testing"
 	"time"
 )
@@ -29,23 +31,41 @@ func startProxy(t *testing.T, backend string) string {
 	return ln.Addr().String()
 }
 
-func TestForwardsBytesBothDirections(t *testing.T) {
-	backendLn := listenLoopback(t)
-	defer backendLn.Close()
-
+// rawHTTPBackend accepts a single connection and, for each entry in
+// responses, reads one HTTP request off it and writes back the given raw
+// response bytes verbatim. This is deliberately hand-written rather than
+// built on net/http.Server, so the tests can construct exact framing
+// (Content-Length, chunked, Connection: close) instead of trusting the
+// standard server to always produce it the same way the proxy needs to
+// prove it understands.
+func rawHTTPBackend(t *testing.T, ln net.Listener, responses []string) {
+	t.Helper()
 	go func() {
-		conn, err := backendLn.Accept()
+		conn, err := ln.Accept()
 		if err != nil {
 			return
 		}
 		defer conn.Close()
-		// Echo back everything the client sends, uppercased, so the test
-		// can tell the bytes actually round-tripped through the backend
-		// rather than a client just reading back its own write.
-		buf := make([]byte, 4096)
-		n, _ := conn.Read(buf)
-		conn.Write([]byte("echo:" + string(buf[:n])))
+		r := bufio.NewReader(conn)
+		for _, resp := range responses {
+			req, err := http.ReadRequest(r)
+			if err != nil {
+				return
+			}
+			io.Copy(io.Discard, req.Body)
+			if _, err := conn.Write([]byte(resp)); err != nil {
+				return
+			}
+		}
 	}()
+}
+
+func TestForwardsSingleRequestResponse(t *testing.T) {
+	backendLn := listenLoopback(t)
+	defer backendLn.Close()
+	rawHTTPBackend(t, backendLn, []string{
+		"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello",
+	})
 
 	proxyAddr := startProxy(t, backendLn.Addr().String())
 
@@ -55,36 +75,32 @@ func TestForwardsBytesBothDirections(t *testing.T) {
 	}
 	defer client.Close()
 
-	if _, err := client.Write([]byte("hello")); err != nil {
-		t.Fatalf("write: %v", err)
+	if _, err := client.Write([]byte("GET /hello HTTP/1.1\r\nHost: test\r\n\r\n")); err != nil {
+		t.Fatalf("write request: %v", err)
 	}
 
 	client.SetReadDeadline(time.Now().Add(2 * time.Second))
-	buf := make([]byte, 4096)
-	n, err := client.Read(buf)
+	resp, err := http.ReadResponse(bufio.NewReader(client), &http.Request{Method: "GET"})
 	if err != nil {
-		t.Fatalf("read: %v", err)
+		t.Fatalf("read response: %v", err)
 	}
+	defer resp.Body.Close()
 
-	got := string(buf[:n])
-	want := "echo:hello"
-	if got != want {
-		t.Fatalf("got %q, want %q", got, want)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if got, want := string(body), "hello"; got != want {
+		t.Fatalf("body = %q, want %q", got, want)
 	}
 }
 
-func TestClientSeesEOFWhenBackendCloses(t *testing.T) {
+func TestChunkedResponseBodyForwarded(t *testing.T) {
 	backendLn := listenLoopback(t)
 	defer backendLn.Close()
-
-	go func() {
-		conn, err := backendLn.Accept()
-		if err != nil {
-			return
-		}
-		// Hang up immediately without writing anything.
-		conn.Close()
-	}()
+	rawHTTPBackend(t, backendLn, []string{
+		"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n",
+	})
 
 	proxyAddr := startProxy(t, backendLn.Addr().String())
 
@@ -93,48 +109,130 @@ func TestClientSeesEOFWhenBackendCloses(t *testing.T) {
 		t.Fatalf("dial proxy: %v", err)
 	}
 	defer client.Close()
+
+	if _, err := client.Write([]byte("GET / HTTP/1.1\r\nHost: test\r\n\r\n")); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+
+	client.SetReadDeadline(time.Now().Add(2 * time.Second))
+	resp, err := http.ReadResponse(bufio.NewReader(client), &http.Request{Method: "GET"})
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if got, want := string(body), "hello world"; got != want {
+		t.Fatalf("body = %q, want %q (chunked reassembly failed)", got, want)
+	}
+}
+
+func TestPersistentConnectionCarriesMultipleRequests(t *testing.T) {
+	backendLn := listenLoopback(t)
+	defer backendLn.Close()
+	rawHTTPBackend(t, backendLn, []string{
+		"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\none",
+		"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\ntwo",
+	})
+
+	proxyAddr := startProxy(t, backendLn.Addr().String())
+
+	client, err := net.Dial("tcp", proxyAddr)
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer client.Close()
+	client.SetReadDeadline(time.Now().Add(2 * time.Second))
+	clientReader := bufio.NewReader(client)
+
+	for _, want := range []string{"one", "two"} {
+		if _, err := client.Write([]byte("GET / HTTP/1.1\r\nHost: test\r\n\r\n")); err != nil {
+			t.Fatalf("write request: %v", err)
+		}
+		resp, err := http.ReadResponse(clientReader, &http.Request{Method: "GET"})
+		if err != nil {
+			t.Fatalf("read response: %v", err)
+		}
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		if got := string(body); got != want {
+			t.Fatalf("body = %q, want %q", got, want)
+		}
+	}
+}
+
+func TestConnectionCloseHeaderEndsConnection(t *testing.T) {
+	backendLn := listenLoopback(t)
+	defer backendLn.Close()
+	rawHTTPBackend(t, backendLn, []string{
+		"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+	})
+
+	proxyAddr := startProxy(t, backendLn.Addr().String())
+
+	client, err := net.Dial("tcp", proxyAddr)
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer client.Close()
+	client.SetReadDeadline(time.Now().Add(2 * time.Second))
+	clientReader := bufio.NewReader(client)
+
+	if _, err := client.Write([]byte("GET / HTTP/1.1\r\nHost: test\r\n\r\n")); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+	resp, err := http.ReadResponse(clientReader, &http.Request{Method: "GET"})
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !resp.Close {
+		t.Fatal("response should have parsed Close=true from Connection: close")
+	}
+
+	// The proxy should have torn the connection down after that response.
+	// A further read should see EOF (or the write itself may fail),
+	// rather than the proxy waiting around for a request that will never
+	// get a reply.
+	client.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 16)
+	_, err = clientReader.Read(buf)
+	if err != io.EOF {
+		t.Fatalf("got err %v, want io.EOF after Connection: close", err)
+	}
+}
+
+func TestMalformedRequestClosesConnectionCleanly(t *testing.T) {
+	backendLn := listenLoopback(t)
+	defer backendLn.Close()
+	// No responses queued: a well-behaved proxy rejects the malformed
+	// request before ever forwarding anything to the backend.
+	rawHTTPBackend(t, backendLn, nil)
+
+	proxyAddr := startProxy(t, backendLn.Addr().String())
+
+	client, err := net.Dial("tcp", proxyAddr)
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer client.Close()
+
+	if _, err := client.Write([]byte("this is not an HTTP request\r\n\r\n")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
 
 	client.SetReadDeadline(time.Now().Add(2 * time.Second))
 	buf := make([]byte, 16)
 	_, err = client.Read(buf)
 	if err != io.EOF {
-		t.Fatalf("got err %v, want io.EOF", err)
-	}
-}
-
-func TestBackendSeesEOFWhenClientCloses(t *testing.T) {
-	backendLn := listenLoopback(t)
-	defer backendLn.Close()
-
-	backendSawEOF := make(chan bool, 1)
-	go func() {
-		conn, err := backendLn.Accept()
-		if err != nil {
-			return
-		}
-		defer conn.Close()
-		buf := make([]byte, 16)
-		conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-		_, err = conn.Read(buf)
-		backendSawEOF <- err == io.EOF
-	}()
-
-	proxyAddr := startProxy(t, backendLn.Addr().String())
-
-	client, err := net.Dial("tcp", proxyAddr)
-	if err != nil {
-		t.Fatalf("dial proxy: %v", err)
-	}
-	// Close immediately without writing anything.
-	client.Close()
-
-	select {
-	case sawEOF := <-backendSawEOF:
-		if !sawEOF {
-			t.Fatal("backend did not see EOF after client closed")
-		}
-	case <-time.After(3 * time.Second):
-		t.Fatal("timed out waiting for backend to observe client close")
+		t.Fatalf("got err %v, want io.EOF (proxy should close, not hang, on a malformed request)", err)
 	}
 }
 

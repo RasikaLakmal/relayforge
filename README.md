@@ -6,7 +6,9 @@ Part of a personal [engineering lab](../../checklist.md) of systems-depth projec
 
 ## What's here
 
-- **Milestone 0: raw TCP forwarding**: accept a client connection, dial one fixed backend, copy bytes bidirectionally until either side hangs up. No HTTP awareness yet, this just proves the base plumbing (accept loop, bidirectional copy, half-close propagation) works before anything smarter is layered on.
+- **Request/response forwarding**: each client connection is dialed through to a single fixed backend, then read and forwarded one HTTP/1.1 request at a time rather than as a blind byte copy, so there is a clear boundary around each request instead of just a stream of bytes.
+- **Framing-aware**: `Content-Length`, chunked encoding, and `Connection: close` are parsed with `net/http`'s `http.ReadRequest`/`http.ReadResponse`, not reimplemented by hand.
+- **Persistent connections**: a single TCP connection can carry many HTTP requests in sequence, gated by the connection's own close framing rather than the proxy assuming one request per connection.
 
 ## Usage
 
@@ -19,9 +21,11 @@ Every connection to `-listen` is forwarded to `-backend`. There is no routing or
 
 ## Known limitations
 
-- Single fixed backend, no config file, no multiple backends, no load balancing yet (milestones 2 onward).
-- No HTTP awareness: this forwards raw bytes, so persistent HTTP/1.1 connections work but there is no request boundary to hang retries, per-request routing, or metrics on (milestone 1).
-- `go test -race` could not be run in this environment: no C compiler is installed, and the race detector requires cgo. Tests were run and pass under plain `go test ./...`; race detection should be run wherever a C toolchain is available before trusting concurrency-sensitive milestones (connection pooling, health state, retry counters) at face value.
+- Single fixed backend, no config file, no multiple backends, no load balancing yet.
+- No connection pooling yet: each client connection dials its own backend connection, and if the backend closes it, the client connection is closed too even if the client asked to keep it alive.
+- Hop-by-hop headers (`Connection`, `Keep-Alive`, `TE`, `Trailer`, etc.) are forwarded to the backend as-is rather than being stripped per RFC 7230 6.1. Harmless for the backends tested against so far, but not strictly correct proxy behavior.
+- `Request.Write` always emits the request line as HTTP/1.1 regardless of what the client actually sent, so an HTTP/1.0 request is silently upgraded on the wire to the backend.
+- `go test -race` could not be run in this environment: no C compiler is installed, and the race detector requires cgo. Tests were run and pass under plain `go test ./...`; race detection should be run wherever a C toolchain is available before trusting concurrency-sensitive work (connection pooling, health state, retry counters) at face value.
 
 ## Testing
 
@@ -29,4 +33,4 @@ Every connection to `-listen` is forwarded to `-backend`. There is no routing or
 go test ./...
 ```
 
-Covers: data flowing correctly in both directions, the client observing EOF when the backend closes first, the backend observing EOF when the client closes first, and the client connection being closed cleanly when the backend dial fails.
+Covers: a single request/response round trip through the proxy, a chunked response body reassembled correctly, two requests carried over one persistent connection, a connection torn down after a `Connection: close` response, a malformed request rejected cleanly instead of hanging the proxy, and the client connection closed cleanly when the backend dial fails.

@@ -1,18 +1,24 @@
-// Package proxy implements the core TCP forwarding loop that everything
-// else in relayforge builds on: accept a client connection, dial a backend,
-// copy bytes in both directions until either side hangs up.
+// Package proxy implements request/response level forwarding: read one
+// HTTP/1.1 request off the client connection at a time, forward it to a
+// backend as its own message, and write back the matching response. A TCP
+// connection can carry many requests; this is what gives each of them its
+// own boundary, which per-request routing, retries, and metrics need in
+// later milestones and a raw byte pipe cannot provide.
 package proxy
 
 import (
-	"io"
+	"bufio"
 	"log"
 	"net"
+	"net/http"
 )
 
 // Server forwards every accepted connection to a single fixed backend
-// address. It has no HTTP awareness, no routing, and no health checks,
-// those come in later milestones once there's a request boundary to hang
-// them on.
+// address. It has no routing or health checks yet, and no connection
+// pooling: each client connection gets its own backend connection, and if
+// the backend closes it, the client connection closes too rather than
+// being kept alive against a fresh backend dial. Those come in later
+// milestones.
 type Server struct {
 	ListenAddr string
 	Backend    string
@@ -44,10 +50,8 @@ func (s *Server) Serve(ln net.Listener) error {
 	}
 }
 
-// handleConn dials the backend and copies bytes bidirectionally until both
-// directions have drained. A half-close (CloseWrite) is used instead of a
-// full close when one side finishes first, so the still-open direction can
-// keep flowing instead of getting torn down along with it.
+// handleConn dials the backend once for this client connection, then keeps
+// forwarding requests off it until either side ends the connection.
 func (s *Server) handleConn(client net.Conn) {
 	defer client.Close()
 
@@ -58,35 +62,45 @@ func (s *Server) handleConn(client net.Conn) {
 	}
 	defer backend.Close()
 
-	done := make(chan struct{}, 2)
+	clientReader := bufio.NewReader(client)
+	backendReader := bufio.NewReader(backend)
 
-	go func() {
-		io.Copy(backend, client)
-		closeWrite(backend)
-		done <- struct{}{}
-	}()
-
-	go func() {
-		io.Copy(client, backend)
-		closeWrite(client)
-		done <- struct{}{}
-	}()
-
-	<-done
-	<-done
+	for s.forwardOneRequest(client, clientReader, backend, backendReader) {
+	}
 }
 
-// closeWrite half-closes the write side of conn, if it supports doing so,
-// so the peer observes EOF without the read side being torn down too. Most
-// callers here are *net.TCPConn, which does; the interface check is only a
-// safety net for the connection types that don't.
-func closeWrite(conn net.Conn) {
-	type writeCloser interface {
-		CloseWrite() error
+// forwardOneRequest reads one HTTP request off the client, forwards it to
+// the backend, and writes back the matching response. It reports whether
+// the same connection should be used for another request: both request and
+// response framing (Connection: close, HTTP/1.0 with no keep-alive) can end
+// the connection, and a malformed or partial request is rejected outright
+// rather than left hanging.
+func (s *Server) forwardOneRequest(client net.Conn, clientReader *bufio.Reader, backend net.Conn, backendReader *bufio.Reader) bool {
+	req, err := http.ReadRequest(clientReader)
+	if err != nil {
+		return false
 	}
-	if wc, ok := conn.(writeCloser); ok {
-		wc.CloseWrite()
-		return
+
+	if err := req.Write(backend); err != nil {
+		log.Printf("relayforge: write to backend failed: %v", err)
+		return false
 	}
-	conn.Close()
+
+	resp, err := http.ReadResponse(backendReader, req)
+	if err != nil {
+		log.Printf("relayforge: read from backend failed: %v", err)
+		return false
+	}
+	defer resp.Body.Close()
+
+	if err := resp.Write(client); err != nil {
+		log.Printf("relayforge: write to client failed: %v", err)
+		return false
+	}
+
+	// If the backend closed on us, the connection this client has can't
+	// be reused for its next request either: there is no pooling yet to
+	// dial a fresh backend connection mid-stream, so the whole thing ends
+	// here even if the client itself asked to keep it alive.
+	return !req.Close && !resp.Close
 }
