@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 )
@@ -51,14 +52,14 @@ func startHealthCheckedProxy(t *testing.T, interval, timeout time.Duration, back
 }
 
 // rawHTTPBackend answers up to len(responses) real HTTP requests with the
-// corresponding raw response bytes verbatim, one request per connection,
-// matching how the proxy dials a fresh backend connection per request
-// rather than reusing one. It accepts connections in an unbounded loop
-// rather than exactly len(responses) times, and only consumes a queued
-// response once it has actually parsed a request off a connection: a
-// health-check probe (connect, then close without sending anything) is a
-// connection too, and a real backend would not be disturbed by one, so
-// this fake should not treat it as consuming a response slot either.
+// corresponding raw response bytes verbatim, behaving like an ordinary
+// HTTP/1.1 keep-alive server: it keeps serving requests off the same
+// accepted connection until that response says Connection: close, the
+// peer stops sending requests on it (the proxy dialed a different
+// connection instead, or a health-check probe connected and closed
+// without ever sending a request), or the responses are exhausted. A
+// probe connection does not consume a queued response slot, only an
+// actual parsed request does.
 func rawHTTPBackend(t *testing.T, ln net.Listener, responses []string) {
 	t.Helper()
 	go func() {
@@ -68,17 +69,90 @@ func rawHTTPBackend(t *testing.T, ln net.Listener, responses []string) {
 			if err != nil {
 				return
 			}
-			req, err := http.ReadRequest(bufio.NewReader(conn))
+			r := bufio.NewReader(conn)
+			for i < len(responses) {
+				req, err := http.ReadRequest(r)
+				if err != nil {
+					break
+				}
+				io.Copy(io.Discard, req.Body)
+				resp := responses[i]
+				i++
+				if _, err := conn.Write([]byte(resp)); err != nil {
+					break
+				}
+				if strings.Contains(resp, "Connection: close") {
+					break
+				}
+			}
+			conn.Close()
+		}
+	}()
+}
+
+// singleConnBackend accepts connections until one of them actually sends a
+// real request (skipping over anything else, such as a stray
+// health-check probe), then commits to serving every remaining queued
+// response off that one connection only, never accepting again. Because
+// of that, it structurally proves whether the proxy reused this backend
+// connection across requests: if the proxy instead dialed a fresh one for
+// a later request, nothing would ever accept it, and that request would
+// hang waiting for a response that never arrives.
+func singleConnBackend(t *testing.T, ln net.Listener, responses []string) {
+	t.Helper()
+	go func() {
+		var conn net.Conn
+		var r *bufio.Reader
+		for {
+			c, err := ln.Accept()
 			if err != nil {
-				conn.Close()
+				return
+			}
+			br := bufio.NewReader(c)
+			req, err := http.ReadRequest(br)
+			if err != nil {
+				c.Close()
 				continue
 			}
 			io.Copy(io.Discard, req.Body)
-			conn.Write([]byte(responses[i]))
-			conn.Close()
-			i++
+			conn, r = c, br
+			if _, err := conn.Write([]byte(responses[0])); err != nil {
+				conn.Close()
+				return
+			}
+			break
+		}
+		defer conn.Close()
+		for _, resp := range responses[1:] {
+			req, err := http.ReadRequest(r)
+			if err != nil {
+				return
+			}
+			io.Copy(io.Discard, req.Body)
+			if _, err := conn.Write([]byte(resp)); err != nil {
+				return
+			}
 		}
 	}()
+}
+
+// acceptRealRequest accepts connections on ln until one of them actually
+// sends a parseable HTTP request, skipping and closing anything else
+// (such as a stray health-check probe that just connects and closes), and
+// returns that connection with the request already parsed off it.
+func acceptRealRequest(ln net.Listener) (net.Conn, *http.Request, error) {
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			return nil, nil, err
+		}
+		req, err := http.ReadRequest(bufio.NewReader(conn))
+		if err != nil {
+			conn.Close()
+			continue
+		}
+		return conn, req, nil
+	}
 }
 
 // readOneResponse reads one HTTP response off r and returns its body as a
@@ -491,5 +565,149 @@ func TestAllBackendsUnhealthyFailsCleanly(t *testing.T) {
 	_, err = client.Read(buf)
 	if err != io.EOF {
 		t.Fatalf("got err %v, want io.EOF (no healthy backends, request should fail cleanly)", err)
+	}
+}
+
+func TestConnectionPoolingReusesBackendConnection(t *testing.T) {
+	backendLn := listenLoopback(t)
+	defer backendLn.Close()
+	singleConnBackend(t, backendLn, []string{canned200("one"), canned200("two"), canned200("three")})
+
+	proxyAddr := startProxy(t, backendLn.Addr().String())
+
+	// Three separate client connections, each making one request.
+	// singleConnBackend only ever accepts once, so this only works at all
+	// if the proxy pools and reuses that one backend connection across
+	// all three, an unpooled proxy dialing fresh each time would leave
+	// requests two and three hanging against a backend that never
+	// accepts them.
+	for _, want := range []string{"one", "two", "three"} {
+		client, err := net.Dial("tcp", proxyAddr)
+		if err != nil {
+			t.Fatalf("dial proxy: %v", err)
+		}
+		client.SetReadDeadline(time.Now().Add(2 * time.Second))
+		if _, err := client.Write([]byte("GET / HTTP/1.1\r\nHost: test\r\n\r\n")); err != nil {
+			t.Fatalf("write request: %v", err)
+		}
+		got := readOneResponse(t, bufio.NewReader(client))
+		client.Close()
+		if got != want {
+			t.Fatalf("body = %q, want %q", got, want)
+		}
+	}
+}
+
+func TestConnectionCloseResponseIsNotPooled(t *testing.T) {
+	backendLn := listenLoopback(t)
+	defer backendLn.Close()
+
+	go func() {
+		// First connection: exactly one response, explicitly
+		// Connection: close, then the backend itself hangs up, exactly
+		// like a real server honoring the header it just sent.
+		conn1, req, err := acceptRealRequest(backendLn)
+		if err != nil {
+			return
+		}
+		io.Copy(io.Discard, req.Body)
+		conn1.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nfirst"))
+		conn1.Close()
+
+		// A second, separate connection is expected for the next
+		// request: the first one was not poolable, so if the proxy
+		// tried to reuse it anyway, this Accept would never be needed
+		// and the next request would just fail against the dead
+		// connection instead.
+		conn2, req2, err := acceptRealRequest(backendLn)
+		if err != nil {
+			return
+		}
+		defer conn2.Close()
+		io.Copy(io.Discard, req2.Body)
+		conn2.Write([]byte(canned200("second-conn")))
+	}()
+
+	proxyAddr := startProxy(t, backendLn.Addr().String())
+
+	client1, err := net.Dial("tcp", proxyAddr)
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	client1.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := client1.Write([]byte("GET / HTTP/1.1\r\nHost: test\r\n\r\n")); err != nil {
+		t.Fatalf("write request 1: %v", err)
+	}
+	if got, want := readOneResponse(t, bufio.NewReader(client1)), "first"; got != want {
+		t.Fatalf("first body = %q, want %q", got, want)
+	}
+	client1.Close()
+
+	client2, err := net.Dial("tcp", proxyAddr)
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer client2.Close()
+	client2.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := client2.Write([]byte("GET / HTTP/1.1\r\nHost: test\r\n\r\n")); err != nil {
+		t.Fatalf("write request 2: %v", err)
+	}
+	if got, want := readOneResponse(t, bufio.NewReader(client2)), "second-conn"; got != want {
+		t.Fatalf("second body = %q, want %q (a Connection: close response should not have been pooled)", got, want)
+	}
+}
+
+func TestPooledConnectionGoneStaleFailsCleanly(t *testing.T) {
+	backendLn := listenLoopback(t)
+	defer backendLn.Close()
+
+	backendSideConn := make(chan net.Conn, 1)
+	go func() {
+		conn, req, err := acceptRealRequest(backendLn)
+		if err != nil {
+			return
+		}
+		backendSideConn <- conn
+		io.Copy(io.Discard, req.Body)
+		conn.Write([]byte(canned200("first")))
+		// Deliberately left open (ordinary keep-alive, no Connection:
+		// close), so the proxy pools it. The test itself will then kill
+		// it out from under the pool, simulating the backend dropping an
+		// idle connection on its own schedule.
+	}()
+
+	proxyAddr := startProxy(t, backendLn.Addr().String())
+
+	client1, err := net.Dial("tcp", proxyAddr)
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	client1.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := client1.Write([]byte("GET / HTTP/1.1\r\nHost: test\r\n\r\n")); err != nil {
+		t.Fatalf("write request 1: %v", err)
+	}
+	if got, want := readOneResponse(t, bufio.NewReader(client1)), "first"; got != want {
+		t.Fatalf("first body = %q, want %q", got, want)
+	}
+	client1.Close()
+
+	(<-backendSideConn).Close()
+	// Give the close a moment to actually land before the pool entry
+	// gets reused, otherwise this races the closure itself.
+	time.Sleep(50 * time.Millisecond)
+
+	client2, err := net.Dial("tcp", proxyAddr)
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer client2.Close()
+	if _, err := client2.Write([]byte("GET / HTTP/1.1\r\nHost: test\r\n\r\n")); err != nil {
+		t.Fatalf("write request 2: %v", err)
+	}
+	client2.SetReadDeadline(time.Now().Add(1 * time.Second))
+	buf := make([]byte, 16)
+	_, err = client2.Read(buf)
+	if err != io.EOF {
+		t.Fatalf("got err %v, want io.EOF (a stale pooled connection should fail the request cleanly, no retry yet)", err)
 	}
 }

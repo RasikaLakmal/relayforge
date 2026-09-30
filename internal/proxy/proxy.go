@@ -1,10 +1,10 @@
 // Package proxy implements request/response level forwarding: read one
 // HTTP/1.1 request off the client connection at a time, round-robin to
-// pick a healthy backend, forward the request to it as its own message,
-// and write back the matching response. A TCP connection can carry many
-// requests; this is what gives each of them its own boundary, which
-// per-request routing, retries, and metrics need and a raw byte pipe
-// cannot provide.
+// pick a healthy backend, forward the request to it over a pooled or
+// freshly dialed connection, and write back the matching response. A TCP
+// connection can carry many requests; this is what gives each of them its
+// own boundary, which per-request routing, retries, metrics, and backend
+// connection reuse all need and a raw byte pipe cannot provide.
 package proxy
 
 import (
@@ -13,23 +13,31 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"sync"
 	"sync/atomic"
 	"time"
 )
 
 // defaultHealthCheckInterval and defaultHealthCheckTimeout apply whenever
-// Server's corresponding fields are left at zero.
+// Server's corresponding fields are left at zero. maxIdleConnsPerBackend
+// bounds how many idle backend connections are kept around per backend;
+// it is a fixed constant rather than a flag for now, there is no
+// benchmark yet that would justify exposing it as one.
 const (
 	defaultHealthCheckInterval = 5 * time.Second
 	defaultHealthCheckTimeout  = 2 * time.Second
+	maxIdleConnsPerBackend     = 8
 )
 
 // Server forwards every request to one of Backends, chosen in round-robin
 // order among whichever of them the periodic health check currently
 // considers reachable. A backend is assumed healthy until the first check
 // says otherwise, so nothing is taken out of rotation before it has
-// actually been probed. There is no connection pooling yet either: every
-// request dials its own fresh backend connection rather than reusing one.
+// actually been probed. A backend connection that finishes a request
+// cleanly (no error, no Connection: close) is kept idle and reused by a
+// later request to the same backend rather than being dialed again from
+// scratch, regardless of which client connection that later request
+// arrives on.
 type Server struct {
 	ListenAddr string
 	Backends   []string
@@ -43,6 +51,9 @@ type Server struct {
 
 	next    uint64
 	healthy []atomic.Bool
+
+	idleMu sync.Mutex
+	idle   map[string][]net.Conn
 }
 
 // ListenAndServe opens ListenAddr and serves it until Accept fails.
@@ -68,6 +79,7 @@ func (s *Server) Serve(ln net.Listener) error {
 	for i := range s.healthy {
 		s.healthy[i].Store(true)
 	}
+	s.idle = make(map[string][]net.Conn)
 	go s.probeAllBackends()
 	go s.runHealthChecks()
 
@@ -145,6 +157,36 @@ func (s *Server) nextBackend() (string, bool) {
 	return "", false
 }
 
+// takeIdleConn returns a pooled, idle connection to addr if one is
+// available, or nil if the caller should dial a fresh one.
+func (s *Server) takeIdleConn(addr string) net.Conn {
+	s.idleMu.Lock()
+	defer s.idleMu.Unlock()
+	conns := s.idle[addr]
+	if len(conns) == 0 {
+		return nil
+	}
+	conn := conns[len(conns)-1]
+	s.idle[addr] = conns[:len(conns)-1]
+	return conn
+}
+
+// putIdleConn returns conn to addr's idle pool for reuse by a later
+// request, unless the pool for that backend is already at capacity, in
+// which case conn is simply closed instead of accumulating unboundedly.
+func (s *Server) putIdleConn(addr string, conn net.Conn) {
+	s.idleMu.Lock()
+	full := len(s.idle[addr]) >= maxIdleConnsPerBackend
+	if !full {
+		s.idle[addr] = append(s.idle[addr], conn)
+	}
+	s.idleMu.Unlock()
+
+	if full {
+		conn.Close()
+	}
+}
+
 func (s *Server) handleConn(client net.Conn) {
 	defer client.Close()
 
@@ -154,11 +196,19 @@ func (s *Server) handleConn(client net.Conn) {
 }
 
 // forwardOneRequest reads one HTTP request off the client, round-robins to
-// pick a healthy backend, dials a fresh connection to it for this request
-// alone, and writes back the response. It reports whether the client
-// connection should be used for another request: request/response close
-// framing, no healthy backend being available, a failed backend dial, and
-// a malformed or partial request all end it.
+// pick a healthy backend, gets a connection to it (reused from the idle
+// pool if one is available, freshly dialed otherwise), and writes back the
+// response. It reports whether the client connection should be used for
+// another request: request/response close framing, no healthy backend
+// being available, a failed backend dial, and a malformed or partial
+// request all end it.
+//
+// A pooled connection can go stale between being returned and being
+// picked up again, the backend is free to close an idle connection on its
+// own schedule, and the pool has no way to know until it actually tries to
+// use it. That failure is not retried against a fresh connection yet:
+// retry eligibility is deliberately its own later concern, not folded in
+// here.
 func (s *Server) forwardOneRequest(client net.Conn, clientReader *bufio.Reader) bool {
 	req, err := http.ReadRequest(clientReader)
 	if err != nil {
@@ -171,28 +221,39 @@ func (s *Server) forwardOneRequest(client net.Conn, clientReader *bufio.Reader) 
 		return false
 	}
 
-	backend, err := net.Dial("tcp", backendAddr)
-	if err != nil {
-		log.Printf("relayforge: dial backend %s failed: %v", backendAddr, err)
-		return false
+	backend := s.takeIdleConn(backendAddr)
+	if backend == nil {
+		backend, err = net.Dial("tcp", backendAddr)
+		if err != nil {
+			log.Printf("relayforge: dial backend %s failed: %v", backendAddr, err)
+			return false
+		}
 	}
-	defer backend.Close()
 
 	if err := req.Write(backend); err != nil {
+		backend.Close()
 		log.Printf("relayforge: write to backend %s failed: %v", backendAddr, err)
 		return false
 	}
 
 	resp, err := http.ReadResponse(bufio.NewReader(backend), req)
 	if err != nil {
+		backend.Close()
 		log.Printf("relayforge: read from backend %s failed: %v", backendAddr, err)
 		return false
 	}
 	defer resp.Body.Close()
 
 	if err := resp.Write(client); err != nil {
+		backend.Close()
 		log.Printf("relayforge: write to client failed: %v", err)
 		return false
+	}
+
+	if resp.Close {
+		backend.Close()
+	} else {
+		s.putIdleConn(backendAddr, backend)
 	}
 
 	return !req.Close && !resp.Close
