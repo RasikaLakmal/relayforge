@@ -33,26 +33,50 @@ func startProxy(t *testing.T, backends ...string) string {
 	return ln.Addr().String()
 }
 
-// rawHTTPBackend accepts one connection per entry in responses, reads
-// exactly one HTTP request off each, and writes back the corresponding
-// raw response bytes verbatim before closing that connection. The proxy
-// dials a fresh backend connection per request rather than reusing one
-// (pooling comes later), so each response here gets its own accept
-// instead of being multiplexed over one long-lived connection.
+// startHealthCheckedProxy is startProxy but with an explicit, short
+// health-check interval and timeout, for tests that need to see health
+// checks actually converge within the test's own deadline rather than
+// relying on the multi-second production defaults.
+func startHealthCheckedProxy(t *testing.T, interval, timeout time.Duration, backends ...string) string {
+	t.Helper()
+	ln := listenLoopback(t)
+	srv := &Server{
+		Backends:            backends,
+		HealthCheckInterval: interval,
+		HealthCheckTimeout:  timeout,
+	}
+	go srv.Serve(ln)
+	t.Cleanup(func() { ln.Close() })
+	return ln.Addr().String()
+}
+
+// rawHTTPBackend answers up to len(responses) real HTTP requests with the
+// corresponding raw response bytes verbatim, one request per connection,
+// matching how the proxy dials a fresh backend connection per request
+// rather than reusing one. It accepts connections in an unbounded loop
+// rather than exactly len(responses) times, and only consumes a queued
+// response once it has actually parsed a request off a connection: a
+// health-check probe (connect, then close without sending anything) is a
+// connection too, and a real backend would not be disturbed by one, so
+// this fake should not treat it as consuming a response slot either.
 func rawHTTPBackend(t *testing.T, ln net.Listener, responses []string) {
 	t.Helper()
 	go func() {
-		for _, resp := range responses {
+		i := 0
+		for i < len(responses) {
 			conn, err := ln.Accept()
 			if err != nil {
 				return
 			}
 			req, err := http.ReadRequest(bufio.NewReader(conn))
-			if err == nil {
-				io.Copy(io.Discard, req.Body)
-				conn.Write([]byte(resp))
+			if err != nil {
+				conn.Close()
+				continue
 			}
+			io.Copy(io.Discard, req.Body)
+			conn.Write([]byte(responses[i]))
 			conn.Close()
+			i++
 		}
 	}()
 }
@@ -281,43 +305,191 @@ func TestRoundRobinDistributesAcrossBackends(t *testing.T) {
 	}
 }
 
-func TestDeadBackendFailsOnlyRequestsRoutedToIt(t *testing.T) {
-	aliveLn := listenLoopback(t)
-	defer aliveLn.Close()
-	rawHTTPBackend(t, aliveLn, []string{canned200("alive")})
+func TestHealthCheckIsPeriodicNotPerRequest(t *testing.T) {
+	backendLn := listenLoopback(t)
+	backendAddr := backendLn.Addr().String()
+	rawHTTPBackend(t, backendLn, []string{canned200("first")})
 
-	deadLn := listenLoopback(t)
-	deadAddr := deadLn.Addr().String()
-	deadLn.Close()
+	// A long interval that will not fire again for the life of this
+	// test: the only check that matters here is the immediate one Serve
+	// runs at startup, which should find this backend healthy.
+	proxyAddr := startHealthCheckedProxy(t, 10*time.Second, 2*time.Second, backendAddr)
 
-	// Round-robin order across these two backends: alive, dead, alive,
-	// dead, ...
-	proxyAddr := startProxy(t, aliveLn.Addr().String(), deadAddr)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if body, ok := requestSucceeds(proxyAddr); ok {
+			if body != "first" {
+				t.Fatalf("body = %q, want %q", body, "first")
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for the startup health check to mark the backend healthy")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// Take the backend down. The next periodic probe is 10s away, well
+	// outside this test, so the proxy has no way to know yet: health
+	// checks catch a dead backend at the next probe, not the instant it
+	// actually goes down.
+	backendLn.Close()
 
 	client, err := net.Dial("tcp", proxyAddr)
 	if err != nil {
 		t.Fatalf("dial proxy: %v", err)
 	}
 	defer client.Close()
-	client.SetReadDeadline(time.Now().Add(2 * time.Second))
-	clientReader := bufio.NewReader(client)
-
 	if _, err := client.Write([]byte("GET / HTTP/1.1\r\nHost: test\r\n\r\n")); err != nil {
-		t.Fatalf("write first request: %v", err)
+		t.Fatalf("write request: %v", err)
 	}
-	if got, want := readOneResponse(t, clientReader), "alive"; got != want {
-		t.Fatalf("first request body = %q, want %q", got, want)
-	}
-
-	// The second request round-robins to the dead backend. There are no
-	// health checks yet to route around it: the dial fails and the whole
-	// client connection ends, not just this one request.
-	if _, err := client.Write([]byte("GET / HTTP/1.1\r\nHost: test\r\n\r\n")); err != nil {
-		t.Fatalf("write second request: %v", err)
-	}
+	client.SetReadDeadline(time.Now().Add(1 * time.Second))
 	buf := make([]byte, 16)
-	_, err = clientReader.Read(buf)
+	_, err = client.Read(buf)
 	if err != io.EOF {
-		t.Fatalf("got err %v, want io.EOF (no health checks yet, so a dead backend ends the connection)", err)
+		t.Fatalf("got err %v, want io.EOF (health checks are periodic, so a backend that just died should still be picked and fail until the next probe)", err)
+	}
+}
+
+// requestSucceeds opens a fresh connection to proxyAddr, sends one GET,
+// and reports the response body and whether it was read successfully at
+// all. Used by the health-check tests below to poll for convergence
+// instead of sleeping a fixed amount and hoping.
+func requestSucceeds(proxyAddr string) (body string, ok bool) {
+	client, err := net.Dial("tcp", proxyAddr)
+	if err != nil {
+		return "", false
+	}
+	defer client.Close()
+	client.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	if _, err := client.Write([]byte("GET / HTTP/1.1\r\nHost: test\r\n\r\n")); err != nil {
+		return "", false
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(client), &http.Request{Method: "GET"})
+	if err != nil {
+		return "", false
+	}
+	b, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		return "", false
+	}
+	return string(b), true
+}
+
+func TestHealthCheckRoutesAroundDeadBackend(t *testing.T) {
+	aliveLn := listenLoopback(t)
+	defer aliveLn.Close()
+	responses := make([]string, 50)
+	for i := range responses {
+		responses[i] = canned200("alive")
+	}
+	rawHTTPBackend(t, aliveLn, responses)
+
+	deadLn := listenLoopback(t)
+	deadAddr := deadLn.Addr().String()
+	deadLn.Close()
+
+	proxyAddr := startHealthCheckedProxy(t, 10*time.Millisecond, 50*time.Millisecond, aliveLn.Addr().String(), deadAddr)
+
+	// Poll until the health checker has converged on "alive is up, dead
+	// is down" and every request lands on alive, rather than sleeping a
+	// fixed guess. A few consecutive successes rules out a lucky
+	// round-robin draw that just happened to skip the dead one this once.
+	deadline := time.Now().Add(3 * time.Second)
+	consecutive := 0
+	for consecutive < 5 {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for health checks to converge, got %d consecutive successes", consecutive)
+		}
+		body, ok := requestSucceeds(proxyAddr)
+		if !ok {
+			consecutive = 0
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+		if body != "alive" {
+			t.Fatalf("body = %q, want %q", body, "alive")
+		}
+		consecutive++
+	}
+}
+
+func TestBackendRecoversAfterHealthCheckPasses(t *testing.T) {
+	aliveLn := listenLoopback(t)
+	defer aliveLn.Close()
+	aliveResponses := make([]string, 50)
+	for i := range aliveResponses {
+		aliveResponses[i] = canned200("alive")
+	}
+	rawHTTPBackend(t, aliveLn, aliveResponses)
+
+	// Reserve an address and close it immediately: this backend starts
+	// out down.
+	recoveringAddr := func() string {
+		ln := listenLoopback(t)
+		defer ln.Close()
+		return ln.Addr().String()
+	}()
+
+	proxyAddr := startHealthCheckedProxy(t, 10*time.Millisecond, 50*time.Millisecond, aliveLn.Addr().String(), recoveringAddr)
+
+	// Give the health checker a moment to actually mark it down first,
+	// so this test exercises recovery rather than the backend never
+	// having been probed as unhealthy in the first place.
+	time.Sleep(100 * time.Millisecond)
+
+	recoveredLn, err := net.Listen("tcp", recoveringAddr)
+	if err != nil {
+		t.Fatalf("re-listen on recovered address: %v", err)
+	}
+	defer recoveredLn.Close()
+	recoveredResponses := make([]string, 50)
+	for i := range recoveredResponses {
+		recoveredResponses[i] = canned200("recovered")
+	}
+	rawHTTPBackend(t, recoveredLn, recoveredResponses)
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if time.Now().After(deadline) {
+			t.Fatal("backend never came back into rotation after its health check started passing")
+		}
+		body, ok := requestSucceeds(proxyAddr)
+		if ok && body == "recovered" {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestAllBackendsUnhealthyFailsCleanly(t *testing.T) {
+	deadLn1 := listenLoopback(t)
+	deadAddr1 := deadLn1.Addr().String()
+	deadLn1.Close()
+	deadLn2 := listenLoopback(t)
+	deadAddr2 := deadLn2.Addr().String()
+	deadLn2.Close()
+
+	proxyAddr := startHealthCheckedProxy(t, 10*time.Millisecond, 50*time.Millisecond, deadAddr1, deadAddr2)
+
+	// Give health checks a generous margin to converge on "both
+	// unhealthy" before asserting on it.
+	time.Sleep(300 * time.Millisecond)
+
+	client, err := net.Dial("tcp", proxyAddr)
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer client.Close()
+	if _, err := client.Write([]byte("GET / HTTP/1.1\r\nHost: test\r\n\r\n")); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+
+	client.SetReadDeadline(time.Now().Add(1 * time.Second))
+	buf := make([]byte, 16)
+	_, err = client.Read(buf)
+	if err != io.EOF {
+		t.Fatalf("got err %v, want io.EOF (no healthy backends, request should fail cleanly)", err)
 	}
 }

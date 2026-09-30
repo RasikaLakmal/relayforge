@@ -5,6 +5,7 @@ import (
 	"flag"
 	"log"
 	"strings"
+	"time"
 
 	"github.com/RasikaLakmal/relayforge/internal/proxy"
 )
@@ -12,6 +13,8 @@ import (
 func main() {
 	listenAddr := flag.String("listen", ":8080", "address to listen on")
 	backendsFlag := flag.String("backends", "", "comma-separated list of backend addresses to round-robin across")
+	healthInterval := flag.Duration("health-interval", 5*time.Second, "how often to probe each backend")
+	healthTimeout := flag.Duration("health-timeout", 2*time.Second, "how long a single health probe waits to connect")
 	flag.Parse()
 
 	if *backendsFlag == "" {
@@ -19,8 +22,10 @@ func main() {
 	}
 
 	srv := &proxy.Server{
-		ListenAddr: *listenAddr,
-		Backends:   strings.Split(*backendsFlag, ","),
+		ListenAddr:          *listenAddr,
+		Backends:            strings.Split(*backendsFlag, ","),
+		HealthCheckInterval: *healthInterval,
+		HealthCheckTimeout:  *healthTimeout,
 	}
 
 	if err := srv.ListenAndServe(); err != nil {

@@ -10,20 +10,23 @@ Part of a personal [engineering lab](../../checklist.md) of systems-depth projec
 - **Framing-aware**: `Content-Length`, chunked encoding, and `Connection: close` are parsed with `net/http`'s `http.ReadRequest`/`http.ReadResponse`, not reimplemented by hand.
 - **Persistent connections**: a single TCP connection can carry many HTTP requests in sequence, gated by the connection's own close framing rather than the proxy assuming one request per connection.
 - **Multiple backends, round robin**: backend selection happens per request, not per connection, so a client's persistent connection is not pinned to one backend, its requests still get distributed round robin across all configured backends.
+- **Health checks**: each backend is probed on an interval with a plain TCP connect, and one that fails is taken out of rotation until a later probe succeeds again. A backend is assumed healthy until the first check says otherwise, so nothing is excluded before it has actually been probed.
 
 ## Usage
 
 ```
 go build -o relayforge ./cmd/relayforge
-./relayforge -listen 127.0.0.1:8080 -backends 127.0.0.1:9090,127.0.0.1:9091
+./relayforge -listen 127.0.0.1:8080 -backends 127.0.0.1:9090,127.0.0.1:9091 -health-interval 5s -health-timeout 2s
 ```
 
-Every request is forwarded to one of `-backends`, chosen round robin, one at a time regardless of how many backends are listed.
+Every request is forwarded to one of `-backends`, chosen round robin among whichever of them the health checker currently considers reachable.
 
 ## Known limitations
 
 - No config file yet, backends are a flag-supplied comma-separated list.
-- No health checks yet: a dead backend is picked in its turn like any other, and the request routed to it simply fails, taking the whole client connection down with it since there is no fallback to another backend mid-request.
+- Health checks are a plain TCP connect, not an HTTP-level check against a real health endpoint, and they run on a fixed interval rather than reacting to a request that actually failed. A backend that dies between two probes still gets picked and fails whatever request lands on it until the next probe catches it.
+- If every backend is currently unhealthy, a request simply fails, there is nothing to fall back to.
+- The health-check goroutine is never stopped, there is no graceful shutdown yet, so it leaks past the point a real shutdown mechanism would stop it.
 - No connection pooling yet: every request dials its own fresh backend connection rather than reusing one.
 - Hop-by-hop headers (`Connection`, `Keep-Alive`, `TE`, `Trailer`, etc.) are forwarded to the backend as-is rather than being stripped per RFC 7230 6.1. Harmless for the backends tested against so far, but not strictly correct proxy behavior.
 - `Request.Write` always emits the request line as HTTP/1.1 regardless of what the client actually sent, so an HTTP/1.0 request is silently upgraded on the wire to the backend.
@@ -35,4 +38,4 @@ Every request is forwarded to one of `-backends`, chosen round robin, one at a t
 go test ./...
 ```
 
-Covers: a single request/response round trip through the proxy, a chunked response body reassembled correctly, two requests carried over one persistent connection, a connection torn down after a `Connection: close` response, a malformed request rejected cleanly instead of hanging the proxy, the client connection closed cleanly when a backend dial fails, requests round-robining across backends in the correct order over a single persistent connection, and a dead backend failing only the requests routed to it.
+Covers: a single request/response round trip through the proxy, a chunked response body reassembled correctly, two requests carried over one persistent connection, a connection torn down after a `Connection: close` response, a malformed request rejected cleanly instead of hanging the proxy, the client connection closed cleanly when a backend dial fails, requests round-robining across backends in the correct order over a single persistent connection, a dead backend getting routed around once health checks converge, a backend rejoining rotation after it recovers, every backend being unhealthy failing requests cleanly, and health checks being periodic rather than catching a backend the instant it dies.
