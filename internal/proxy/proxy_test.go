@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -657,7 +658,14 @@ func TestConnectionCloseResponseIsNotPooled(t *testing.T) {
 	}
 }
 
-func TestPooledConnectionGoneStaleFailsCleanly(t *testing.T) {
+// TestStalePooledConnectionIsRetriedTransparently exercises the exact
+// scenario milestone 4 left undefended (a pooled connection the backend
+// quietly closed while it sat idle), now that milestone 5 adds retry
+// eligibility for it: a write failing on a connection taken from the pool
+// is treated as a dead-connection signal, not as evidence the backend saw
+// anything, so it is retried once against a fresh connection rather than
+// failing the request outright.
+func TestStalePooledConnectionIsRetriedTransparently(t *testing.T) {
 	backendLn := listenLoopback(t)
 	defer backendLn.Close()
 
@@ -671,9 +679,19 @@ func TestPooledConnectionGoneStaleFailsCleanly(t *testing.T) {
 		io.Copy(io.Discard, req.Body)
 		conn.Write([]byte(canned200("first")))
 		// Deliberately left open (ordinary keep-alive, no Connection:
-		// close), so the proxy pools it. The test itself will then kill
-		// it out from under the pool, simulating the backend dropping an
-		// idle connection on its own schedule.
+		// close), so the proxy pools it. The test will then kill it out
+		// from under the pool, simulating the backend dropping an idle
+		// connection on its own schedule.
+
+		// A second, fresh connection for the retry the stale pooled one
+		// should trigger.
+		conn2, req2, err := acceptRealRequest(backendLn)
+		if err != nil {
+			return
+		}
+		defer conn2.Close()
+		io.Copy(io.Discard, req2.Body)
+		conn2.Write([]byte(canned200("second")))
 	}()
 
 	proxyAddr := startProxy(t, backendLn.Addr().String())
@@ -701,13 +719,332 @@ func TestPooledConnectionGoneStaleFailsCleanly(t *testing.T) {
 		t.Fatalf("dial proxy: %v", err)
 	}
 	defer client2.Close()
+	client2.SetReadDeadline(time.Now().Add(2 * time.Second))
 	if _, err := client2.Write([]byte("GET / HTTP/1.1\r\nHost: test\r\n\r\n")); err != nil {
+		t.Fatalf("write request 2: %v", err)
+	}
+	if got, want := readOneResponse(t, bufio.NewReader(client2)), "second"; got != want {
+		t.Fatalf("second body = %q, want %q (a stale pooled connection should be retried transparently)", got, want)
+	}
+}
+
+// TestRequestWithBodyNotRetriedOnStalePooledConnection proves the safety
+// gate that stops the transparent retry above from ever resending a body:
+// replaying a request whose body may already have been partially written
+// isn't safe without buffering it, which isn't implemented, so a request
+// with one is never retried even in the otherwise-eligible stale-pooled
+// -connection case, it just fails.
+func TestRequestWithBodyNotRetriedOnStalePooledConnection(t *testing.T) {
+	backendLn := listenLoopback(t)
+	defer backendLn.Close()
+
+	backendSideConn := make(chan net.Conn, 1)
+	go func() {
+		conn, req, err := acceptRealRequest(backendLn)
+		if err != nil {
+			return
+		}
+		backendSideConn <- conn
+		io.Copy(io.Discard, req.Body)
+		conn.Write([]byte(canned200("first")))
+	}()
+
+	proxyAddr := startProxy(t, backendLn.Addr().String())
+
+	client1, err := net.Dial("tcp", proxyAddr)
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	client1.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := client1.Write([]byte("GET / HTTP/1.1\r\nHost: test\r\n\r\n")); err != nil {
+		t.Fatalf("write request 1: %v", err)
+	}
+	if got, want := readOneResponse(t, bufio.NewReader(client1)), "first"; got != want {
+		t.Fatalf("first body = %q, want %q", got, want)
+	}
+	client1.Close()
+
+	(<-backendSideConn).Close()
+	time.Sleep(50 * time.Millisecond)
+
+	client2, err := net.Dial("tcp", proxyAddr)
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer client2.Close()
+	body := "hello"
+	req := fmt.Sprintf("POST / HTTP/1.1\r\nHost: test\r\nContent-Length: %d\r\n\r\n%s", len(body), body)
+	if _, err := client2.Write([]byte(req)); err != nil {
 		t.Fatalf("write request 2: %v", err)
 	}
 	client2.SetReadDeadline(time.Now().Add(1 * time.Second))
 	buf := make([]byte, 16)
 	_, err = client2.Read(buf)
 	if err != io.EOF {
-		t.Fatalf("got err %v, want io.EOF (a stale pooled connection should fail the request cleanly, no retry yet)", err)
+		t.Fatalf("got err %v, want io.EOF (a request with a body must not be retried, even on an otherwise-eligible stale pooled connection)", err)
+	}
+}
+
+func TestIdempotentRequestRetriedAfterBackendFailsToRespond(t *testing.T) {
+	backend1Ln := listenLoopback(t)
+	defer backend1Ln.Close()
+	go func() {
+		conn, req, err := acceptRealRequest(backend1Ln)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		io.Copy(io.Discard, req.Body)
+		// Accept the request, then just hang up without responding: the
+		// write to this backend succeeds, but the read never gets an
+		// answer.
+	}()
+
+	backend2Ln := listenLoopback(t)
+	defer backend2Ln.Close()
+	rawHTTPBackend(t, backend2Ln, []string{canned200("from-second-backend")})
+
+	proxyAddr := startProxy(t, backend1Ln.Addr().String(), backend2Ln.Addr().String())
+
+	client, err := net.Dial("tcp", proxyAddr)
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer client.Close()
+	client.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := client.Write([]byte("GET / HTTP/1.1\r\nHost: test\r\n\r\n")); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+	if got, want := readOneResponse(t, bufio.NewReader(client)), "from-second-backend"; got != want {
+		t.Fatalf("body = %q, want %q (an idempotent request should be retried against the other backend)", got, want)
+	}
+}
+
+func TestNonIdempotentRequestNotRetriedAfterBackendFailsToRespond(t *testing.T) {
+	backend1Ln := listenLoopback(t)
+	defer backend1Ln.Close()
+	go func() {
+		conn, req, err := acceptRealRequest(backend1Ln)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		io.Copy(io.Discard, req.Body)
+		// Accept the request, then just hang up without responding.
+	}()
+
+	backend2Ln := listenLoopback(t)
+	defer backend2Ln.Close()
+	// Queue a response on the second backend so that if the proxy
+	// incorrectly retried against it, the test would observe a real
+	// response instead of a hang, making the bug obvious rather than
+	// just slow.
+	rawHTTPBackend(t, backend2Ln, []string{canned200("should-not-be-used")})
+
+	proxyAddr := startProxy(t, backend1Ln.Addr().String(), backend2Ln.Addr().String())
+
+	client, err := net.Dial("tcp", proxyAddr)
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer client.Close()
+	if _, err := client.Write([]byte("POST / HTTP/1.1\r\nHost: test\r\nContent-Length: 0\r\n\r\n")); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+	client.SetReadDeadline(time.Now().Add(1 * time.Second))
+	buf := make([]byte, 16)
+	_, err = client.Read(buf)
+	if err != io.EOF {
+		t.Fatalf("got err %v, want io.EOF (a non-idempotent request must not be retried once the backend may have already seen it)", err)
+	}
+}
+
+func TestConnectTimeoutAppliesToBackendDial(t *testing.T) {
+	ln := listenLoopback(t)
+	srv := &Server{
+		// A private, non-routable address: connect() neither succeeds
+		// nor is refused, it just hangs, which is exactly what exercises
+		// a connect timeout rather than an immediate "connection
+		// refused" that would pass for the wrong reason.
+		Backends:       []string{"10.255.255.1:19999"},
+		ConnectTimeout: 200 * time.Millisecond,
+	}
+	go srv.Serve(ln)
+	t.Cleanup(func() { ln.Close() })
+	proxyAddr := ln.Addr().String()
+
+	client, err := net.Dial("tcp", proxyAddr)
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer client.Close()
+	if _, err := client.Write([]byte("GET / HTTP/1.1\r\nHost: test\r\n\r\n")); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+
+	start := time.Now()
+	client.SetReadDeadline(time.Now().Add(3 * time.Second))
+	buf := make([]byte, 16)
+	_, err = client.Read(buf)
+	elapsed := time.Since(start)
+
+	if err != io.EOF {
+		t.Fatalf("got err %v, want io.EOF", err)
+	}
+	if elapsed > 1*time.Second {
+		t.Fatalf("connect timeout was not applied: took %v to fail, want well under 1s", elapsed)
+	}
+}
+
+func TestHeaderTimeoutClosesIdleConnection(t *testing.T) {
+	backendLn := listenLoopback(t)
+	defer backendLn.Close()
+
+	ln := listenLoopback(t)
+	srv := &Server{
+		Backends:      []string{backendLn.Addr().String()},
+		HeaderTimeout: 100 * time.Millisecond,
+	}
+	go srv.Serve(ln)
+	t.Cleanup(func() { ln.Close() })
+
+	client, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer client.Close()
+
+	// Send nothing at all, not even a partial request line, and confirm
+	// the proxy gives up rather than holding this connection open
+	// forever.
+	client.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 16)
+	_, err = client.Read(buf)
+	if err != io.EOF {
+		t.Fatalf("got err %v, want io.EOF (an idle connection past the header timeout should be closed)", err)
+	}
+}
+
+func TestResponseTimeoutFailsSlowBackend(t *testing.T) {
+	backendLn := listenLoopback(t)
+	defer backendLn.Close()
+	go func() {
+		conn, req, err := acceptRealRequest(backendLn)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		io.Copy(io.Discard, req.Body)
+		// Never respond at all: the response timeout, not a hang, should
+		// be what ends this.
+	}()
+
+	ln := listenLoopback(t)
+	srv := &Server{
+		Backends:        []string{backendLn.Addr().String()},
+		ResponseTimeout: 150 * time.Millisecond,
+	}
+	go srv.Serve(ln)
+	t.Cleanup(func() { ln.Close() })
+
+	client, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer client.Close()
+	if _, err := client.Write([]byte("GET / HTTP/1.1\r\nHost: test\r\n\r\n")); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+
+	start := time.Now()
+	client.SetReadDeadline(time.Now().Add(3 * time.Second))
+	buf := make([]byte, 16)
+	_, err = client.Read(buf)
+	elapsed := time.Since(start)
+
+	if err != io.EOF {
+		t.Fatalf("got err %v, want io.EOF", err)
+	}
+	if elapsed > 1*time.Second {
+		t.Fatalf("response timeout was not applied: took %v to fail, want well under 1s", elapsed)
+	}
+}
+
+// TestClientDisconnectCancelsSlowBackendWork is the failure experiment
+// listed in relayforge.md for this milestone: disconnect a client while
+// the proxy is waiting on a slow backend, and confirm the backend
+// work/connection tied to that request is cancelled and cleaned up rather
+// than left running to completion for no one.
+func TestClientDisconnectCancelsSlowBackendWork(t *testing.T) {
+	backendLn := listenLoopback(t)
+	defer backendLn.Close()
+
+	backendSawCancellation := make(chan bool, 1)
+	go func() {
+		conn, req, err := acceptRealRequest(backendLn)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		io.Copy(io.Discard, req.Body)
+
+		// A generous deadline that only matters if cancellation is
+		// broken: if the proxy tears this connection down early after
+		// the client disconnects, this read returns well before it.
+		conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+		buf := make([]byte, 1)
+		_, err = conn.Read(buf)
+		backendSawCancellation <- err != nil
+	}()
+
+	proxyAddr := startProxy(t, backendLn.Addr().String())
+
+	// Snapshot the goroutine count after the server and backend fake are
+	// already running but before this specific request starts, so the
+	// comparison below isolates goroutines this one request spins up
+	// (handleConn, the disconnect watcher) rather than being thrown off
+	// by the server's own permanent per-instance goroutines (the health
+	// checker has no shutdown yet, a separate, already-documented gap).
+	runtime.Gosched()
+	time.Sleep(20 * time.Millisecond)
+	before := runtime.NumGoroutine()
+
+	client, err := net.Dial("tcp", proxyAddr)
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	if _, err := client.Write([]byte("GET / HTTP/1.1\r\nHost: test\r\n\r\n")); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+
+	// Give the proxy a moment to have forwarded the request and be
+	// genuinely blocked waiting on the backend's response, then
+	// disconnect as the client.
+	time.Sleep(100 * time.Millisecond)
+	client.Close()
+
+	select {
+	case sawCancellation := <-backendSawCancellation:
+		if !sawCancellation {
+			t.Fatal("backend connection was not torn down early after the client disconnected")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting to observe whether the backend connection was cancelled")
+	}
+
+	// This request's own goroutines (handleConn, the disconnect watcher)
+	// should have fully exited by now rather than leaking, give them a
+	// moment to actually finish scheduling out, then confirm it.
+	deadline := time.Now().Add(1 * time.Second)
+	for {
+		runtime.Gosched()
+		current := runtime.NumGoroutine()
+		if current <= before {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("goroutine count did not return to baseline after cancellation: before=%d, still=%d", before, current)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }

@@ -18,16 +18,21 @@ import (
 	"time"
 )
 
-// defaultHealthCheckInterval and defaultHealthCheckTimeout apply whenever
-// Server's corresponding fields are left at zero. maxIdleConnsPerBackend
-// bounds how many idle backend connections are kept around per backend;
-// it is a fixed constant rather than a flag for now, there is no
-// benchmark yet that would justify exposing it as one.
+// Defaults applied whenever the corresponding Server field is left at
+// zero. maxIdleConnsPerBackend bounds how many idle backend connections
+// are kept around per backend; it is a fixed constant rather than a flag
+// for now, there is no benchmark yet that would justify exposing it as
+// one.
 const (
 	defaultHealthCheckInterval = 5 * time.Second
 	defaultHealthCheckTimeout  = 2 * time.Second
+	defaultConnectTimeout      = 3 * time.Second
+	defaultHeaderTimeout       = 10 * time.Second
+	defaultResponseTimeout     = 30 * time.Second
 	maxIdleConnsPerBackend     = 8
 )
+
+var errNoHealthyBackends = errors.New("no healthy backends available")
 
 // Server forwards every request to one of Backends, chosen in round-robin
 // order among whichever of them the periodic health check currently
@@ -48,6 +53,19 @@ type Server struct {
 	// HealthCheckTimeout bounds how long a single probe waits to connect.
 	// Zero uses defaultHealthCheckTimeout.
 	HealthCheckTimeout time.Duration
+	// ConnectTimeout bounds dialing a backend. Zero uses
+	// defaultConnectTimeout.
+	ConnectTimeout time.Duration
+	// HeaderTimeout bounds both how long a connection may sit idle
+	// waiting for its next request and how long, once bytes start
+	// arriving, that request has to finish. One value covers both cases
+	// deliberately, splitting them into separate knobs isn't justified
+	// yet. Zero uses defaultHeaderTimeout.
+	HeaderTimeout time.Duration
+	// ResponseTimeout bounds the entire exchange with a backend for one
+	// request: writing the request and reading the response together.
+	// Zero uses defaultResponseTimeout.
+	ResponseTimeout time.Duration
 
 	next    uint64
 	healthy []atomic.Bool
@@ -187,6 +205,27 @@ func (s *Server) putIdleConn(addr string, conn net.Conn) {
 	}
 }
 
+func (s *Server) connectTimeout() time.Duration {
+	if s.ConnectTimeout > 0 {
+		return s.ConnectTimeout
+	}
+	return defaultConnectTimeout
+}
+
+func (s *Server) headerTimeout() time.Duration {
+	if s.HeaderTimeout > 0 {
+		return s.HeaderTimeout
+	}
+	return defaultHeaderTimeout
+}
+
+func (s *Server) responseTimeout() time.Duration {
+	if s.ResponseTimeout > 0 {
+		return s.ResponseTimeout
+	}
+	return defaultResponseTimeout
+}
+
 func (s *Server) handleConn(client net.Conn) {
 	defer client.Close()
 
@@ -195,53 +234,29 @@ func (s *Server) handleConn(client net.Conn) {
 	}
 }
 
-// forwardOneRequest reads one HTTP request off the client, round-robins to
-// pick a healthy backend, gets a connection to it (reused from the idle
-// pool if one is available, freshly dialed otherwise), and writes back the
-// response. It reports whether the client connection should be used for
-// another request: request/response close framing, no healthy backend
-// being available, a failed backend dial, and a malformed or partial
-// request all end it.
-//
-// A pooled connection can go stale between being returned and being
-// picked up again, the backend is free to close an idle connection on its
-// own schedule, and the pool has no way to know until it actually tries to
-// use it. That failure is not retried against a fresh connection yet:
-// retry eligibility is deliberately its own later concern, not folded in
-// here.
+// forwardOneRequest reads one HTTP request off the client and forwards it,
+// with up to one retry against a different backend for failures known not
+// to risk a duplicate side effect (see forwardWithRetry). It reports
+// whether the client connection should be used for another request.
 func (s *Server) forwardOneRequest(client net.Conn, clientReader *bufio.Reader) bool {
+	client.SetReadDeadline(time.Now().Add(s.headerTimeout()))
 	req, err := http.ReadRequest(clientReader)
 	if err != nil {
 		return false
 	}
+	client.SetReadDeadline(time.Time{})
 
-	backendAddr, ok := s.nextBackend()
-	if !ok {
-		log.Printf("relayforge: no healthy backends available")
-		return false
-	}
-
-	backend := s.takeIdleConn(backendAddr)
-	if backend == nil {
-		backend, err = net.Dial("tcp", backendAddr)
-		if err != nil {
-			log.Printf("relayforge: dial backend %s failed: %v", backendAddr, err)
-			return false
+	a := s.forwardWithRetry(client, clientReader, req)
+	if a.err != nil {
+		if errors.Is(a.err, errNoHealthyBackends) {
+			log.Printf("relayforge: %v", a.err)
+		} else {
+			log.Printf("relayforge: request to backend %s failed: %v", a.addr, a.err)
 		}
-	}
-
-	if err := req.Write(backend); err != nil {
-		backend.Close()
-		log.Printf("relayforge: write to backend %s failed: %v", backendAddr, err)
 		return false
 	}
-
-	resp, err := http.ReadResponse(bufio.NewReader(backend), req)
-	if err != nil {
-		backend.Close()
-		log.Printf("relayforge: read from backend %s failed: %v", backendAddr, err)
-		return false
-	}
+	resp := a.resp
+	backend := a.backend
 	defer resp.Body.Close()
 
 	if err := resp.Write(client); err != nil {
@@ -253,8 +268,173 @@ func (s *Server) forwardOneRequest(client net.Conn, clientReader *bufio.Reader) 
 	if resp.Close {
 		backend.Close()
 	} else {
-		s.putIdleConn(backendAddr, backend)
+		s.putIdleConn(a.addr, backend)
 	}
 
 	return !req.Close && !resp.Close
+}
+
+// isIdempotentMethod reports whether method is safe to send more than
+// once against a backend, per ordinary HTTP semantics. POST and PATCH are
+// deliberately excluded: they are the methods most likely to have a
+// side effect that must not happen twice.
+func isIdempotentMethod(method string) bool {
+	switch method {
+	case http.MethodGet, http.MethodHead, http.MethodPut, http.MethodDelete, http.MethodOptions, http.MethodTrace:
+		return true
+	default:
+		return false
+	}
+}
+
+// attempt is the outcome of trying to forward a request to one backend.
+type attempt struct {
+	resp    *http.Response
+	backend net.Conn
+	addr    string
+	// dialed reports whether a backend connection was actually obtained
+	// (pooled or freshly dialed). If false, the request never reached
+	// any backend at all.
+	dialed bool
+	// reused reports whether backend came from the idle pool rather than
+	// being freshly dialed.
+	reused bool
+	// wroteFully reports whether the entire request was written to the
+	// backend before any failure. If false, whatever the backend saw (if
+	// anything) was incomplete.
+	wroteFully bool
+	// clientDisconnected reports whether this attempt's failure was
+	// caused by the client itself going away mid-flight, as opposed to a
+	// backend problem.
+	clientDisconnected bool
+	err                error
+}
+
+// forwardWithRetry sends req to a backend and returns the result,
+// including the backend connection that produced it so the caller can
+// decide whether to pool or close it. It retries exactly once, against a
+// different backend chosen by the normal round-robin order, but only for
+// failures that could not have caused the backend to apply a request
+// twice:
+//
+//   - the backend was never actually reached (dial failed, or there was
+//     no healthy backend to try), so nothing could have been applied
+//   - a write failed against a connection taken from the idle pool,
+//     which is the signature of a backend that closed an idle connection
+//     on its own schedule rather than of it having received anything
+//   - the request method is idempotent (GET, HEAD, PUT, DELETE, OPTIONS,
+//     TRACE), so sending it again cannot itself cause new harm
+//
+// A request with a body is never retried, regardless of the above: doing
+// so safely would mean buffering the body so it can be replayed, which
+// isn't implemented yet. A non-idempotent request (POST, PATCH) whose
+// write may have reached a freshly dialed backend connection before
+// failing is also never retried, that is the deliberately unresolved
+// case, the backend might already have applied it, and retrying blind
+// risks doing it twice.
+func (s *Server) forwardWithRetry(client net.Conn, clientReader *bufio.Reader, req *http.Request) attempt {
+	first := s.attemptOnce(client, clientReader, req)
+	if first.err == nil {
+		return first
+	}
+	if !retryEligible(req, first) {
+		return first
+	}
+	log.Printf("relayforge: retrying request after backend %s failed: %v", first.addr, first.err)
+	return s.attemptOnce(client, clientReader, req)
+}
+
+func retryEligible(req *http.Request, a attempt) bool {
+	if a.clientDisconnected {
+		// The client is already gone; there is no one to hand a
+		// response to even if a retry succeeded, so retrying would only
+		// be extra work spent on a request nobody is waiting for.
+		return false
+	}
+	if !a.dialed {
+		// Never reached any backend: the body, if any, was never
+		// touched, so retrying is always safe regardless of method.
+		return true
+	}
+	if req.ContentLength != 0 {
+		// A body may already have been partially written; replaying it
+		// safely would need buffering it first, which isn't implemented
+		// yet.
+		return false
+	}
+	if !a.wroteFully && a.reused {
+		return true
+	}
+	return isIdempotentMethod(req.Method)
+}
+
+// attemptOnce picks a backend, obtains a connection to it (pooled or
+// freshly dialed), and runs the full request/response exchange once.
+func (s *Server) attemptOnce(client net.Conn, clientReader *bufio.Reader, req *http.Request) attempt {
+	backendAddr, ok := s.nextBackend()
+	if !ok {
+		return attempt{err: errNoHealthyBackends}
+	}
+
+	backend := s.takeIdleConn(backendAddr)
+	reused := backend != nil
+	if backend == nil {
+		var err error
+		backend, err = net.DialTimeout("tcp", backendAddr, s.connectTimeout())
+		if err != nil {
+			return attempt{addr: backendAddr, dialed: false, err: err}
+		}
+	}
+
+	resp, wroteFully, clientDisconnected, err := s.exchangeWithBackend(client, clientReader, backend, req)
+	if err != nil {
+		backend.Close()
+		return attempt{addr: backendAddr, dialed: true, reused: reused, wroteFully: wroteFully, clientDisconnected: clientDisconnected, err: err}
+	}
+	return attempt{resp: resp, backend: backend, addr: backendAddr, dialed: true, reused: reused, wroteFully: true}
+}
+
+// exchangeWithBackend writes req to backend and reads the matching
+// response, bounded by the response timeout. While that is in progress, a
+// side watcher peeks at clientReader without consuming anything: if the
+// client disconnects before the backend has answered, the watcher closes
+// backend to unblock whichever of the write or read was in progress,
+// instead of letting backend work run to completion for a client that is
+// no longer there. Peek is used specifically because it does not consume
+// bytes, an early byte of the client's next pipelined request (if any) is
+// left untouched for the real read that follows.
+//
+// The watcher's own Peek call is itself force-unblocked (via a deadline
+// in the past) once this function is done waiting on the backend, so it
+// doesn't leak past this call. That forced unblock surfaces as a timeout
+// error, which is how the watcher tells a genuine client disconnect
+// (returned as clientDisconnected) apart from its own cancellation.
+func (s *Server) exchangeWithBackend(client net.Conn, clientReader *bufio.Reader, backend net.Conn, req *http.Request) (resp *http.Response, wroteFully bool, clientDisconnected bool, err error) {
+	backend.SetDeadline(time.Now().Add(s.responseTimeout()))
+
+	watcherDone := make(chan bool, 1)
+	go func() {
+		_, peekErr := clientReader.Peek(1)
+		genuine := true
+		if netErr, ok := peekErr.(net.Error); ok && netErr.Timeout() {
+			genuine = false
+		}
+		if genuine {
+			backend.Close()
+		}
+		watcherDone <- genuine
+	}()
+	defer func() {
+		client.SetReadDeadline(time.Now())
+		clientDisconnected = <-watcherDone
+		client.SetReadDeadline(time.Time{})
+	}()
+
+	if werr := req.Write(backend); werr != nil {
+		err = werr
+		return
+	}
+	wroteFully = true
+	resp, err = http.ReadResponse(bufio.NewReader(backend), req)
+	return
 }

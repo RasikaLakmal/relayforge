@@ -15,6 +15,9 @@ func main() {
 	backendsFlag := flag.String("backends", "", "comma-separated list of backend addresses to round-robin across")
 	healthInterval := flag.Duration("health-interval", 5*time.Second, "how often to probe each backend")
 	healthTimeout := flag.Duration("health-timeout", 2*time.Second, "how long a single health probe waits to connect")
+	connectTimeout := flag.Duration("connect-timeout", 3*time.Second, "how long dialing a backend may take")
+	headerTimeout := flag.Duration("header-timeout", 10*time.Second, "how long a connection may wait for its next request, and how long that request has to finish once it starts arriving")
+	responseTimeout := flag.Duration("response-timeout", 30*time.Second, "how long the whole exchange with a backend (request write plus response read) may take")
 	flag.Parse()
 
 	if *backendsFlag == "" {
@@ -26,6 +29,9 @@ func main() {
 		Backends:            strings.Split(*backendsFlag, ","),
 		HealthCheckInterval: *healthInterval,
 		HealthCheckTimeout:  *healthTimeout,
+		ConnectTimeout:      *connectTimeout,
+		HeaderTimeout:       *headerTimeout,
+		ResponseTimeout:     *responseTimeout,
 	}
 
 	if err := srv.ListenAndServe(); err != nil {
