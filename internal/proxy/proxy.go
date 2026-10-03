@@ -9,6 +9,7 @@ package proxy
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"log"
@@ -34,6 +35,11 @@ const (
 )
 
 var errNoHealthyBackends = errors.New("no healthy backends available")
+
+// ErrServerClosed is returned by Serve/ListenAndServe after a graceful
+// Shutdown, distinguishing an intentional stop from a real Accept
+// failure.
+var ErrServerClosed = errors.New("relayforge: server closed")
 
 // Load-balancing strategies recognized by Server.Strategy. The empty
 // string is treated as StrategyRoundRobin.
@@ -90,6 +96,16 @@ type Server struct {
 
 	idleMu sync.Mutex
 	idle   map[string][]net.Conn
+
+	closing          atomic.Bool
+	stopHealthChecks chan struct{}
+	connWG           sync.WaitGroup
+
+	connsMu sync.Mutex
+	conns   map[net.Conn]struct{}
+
+	mu       sync.Mutex
+	listener net.Listener
 }
 
 // ListenAndServe opens ListenAddr and serves it until Accept fails.
@@ -122,6 +138,13 @@ func (s *Server) Serve(ln net.Listener) error {
 	}
 	s.active = make([]int64, len(s.Backends))
 	s.idle = make(map[string][]net.Conn)
+	s.conns = make(map[net.Conn]struct{})
+	s.stopHealthChecks = make(chan struct{})
+
+	s.mu.Lock()
+	s.listener = ln
+	s.mu.Unlock()
+
 	go s.probeAllBackends()
 	go s.runHealthChecks()
 
@@ -134,16 +157,77 @@ func (s *Server) Serve(ln net.Listener) error {
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
+			if s.closing.Load() {
+				return ErrServerClosed
+			}
 			return err
 		}
-		go s.handleConn(conn)
+		s.connWG.Add(1)
+		go func() {
+			defer s.connWG.Done()
+			s.handleConn(conn)
+		}()
 	}
 }
 
-// runHealthChecks probes every backend on a fixed interval for as long as
-// the server runs. There is no shutdown signal for this loop yet, it ends
-// only when the process does, that is a known limitation until graceful
-// shutdown exists.
+// Shutdown stops accepting new connections and waits for in-flight
+// requests to finish before returning, instead of cutting every open
+// connection. Existing persistent client connections finish whatever
+// request is currently in flight, if any, and then close rather than
+// waiting around for a further request that may never come. If ctx is
+// done first, Shutdown force-closes every connection still open (which,
+// via the same disconnect watcher that cancels backend work for a client
+// that left on its own, also tears down whatever backend work was still
+// in flight for them) and returns ctx.Err(); the caller decides what, if
+// anything, to do after that.
+func (s *Server) Shutdown(ctx context.Context) error {
+	s.closing.Store(true)
+	close(s.stopHealthChecks)
+
+	s.mu.Lock()
+	ln := s.listener
+	s.mu.Unlock()
+	if ln != nil {
+		ln.Close()
+	}
+	s.closeIdleConns()
+
+	done := make(chan struct{})
+	go func() {
+		s.connWG.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		s.forceCloseConns()
+		return ctx.Err()
+	}
+}
+
+func (s *Server) forceCloseConns() {
+	s.connsMu.Lock()
+	defer s.connsMu.Unlock()
+	for conn := range s.conns {
+		conn.Close()
+	}
+}
+
+func (s *Server) closeIdleConns() {
+	s.idleMu.Lock()
+	defer s.idleMu.Unlock()
+	for addr, conns := range s.idle {
+		for _, c := range conns {
+			c.Close()
+		}
+		delete(s.idle, addr)
+	}
+}
+
+// runHealthChecks probes every backend on a fixed interval until Shutdown
+// closes stopHealthChecks.
 func (s *Server) runHealthChecks() {
 	interval := s.HealthCheckInterval
 	if interval <= 0 {
@@ -151,8 +235,13 @@ func (s *Server) runHealthChecks() {
 	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-	for range ticker.C {
-		s.probeAllBackends()
+	for {
+		select {
+		case <-ticker.C:
+			s.probeAllBackends()
+		case <-s.stopHealthChecks:
+			return
+		}
 	}
 }
 
@@ -290,11 +379,27 @@ func (s *Server) responseTimeout() time.Duration {
 	return defaultResponseTimeout
 }
 
+// handleConn forwards requests off client until the connection ends or a
+// shutdown is in progress. It is tracked in s.conns for the duration so
+// Shutdown can force-close it if its deadline passes before the
+// connection finishes on its own.
 func (s *Server) handleConn(client net.Conn) {
-	defer client.Close()
+	s.connsMu.Lock()
+	s.conns[client] = struct{}{}
+	s.connsMu.Unlock()
+
+	defer func() {
+		s.connsMu.Lock()
+		delete(s.conns, client)
+		s.connsMu.Unlock()
+		client.Close()
+	}()
 
 	clientReader := bufio.NewReader(client)
-	for s.forwardOneRequest(client, clientReader) {
+	// Checked before waiting for another request, not mid-exchange: a
+	// request already in flight when shutdown starts is left to finish
+	// normally, only the next one is refused.
+	for !s.closing.Load() && s.forwardOneRequest(client, clientReader) {
 	}
 }
 

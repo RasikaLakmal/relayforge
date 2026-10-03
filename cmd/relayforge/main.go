@@ -2,9 +2,14 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"flag"
 	"log"
+	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/RasikaLakmal/relayforge/internal/proxy"
@@ -19,6 +24,7 @@ func main() {
 	connectTimeout := flag.Duration("connect-timeout", 3*time.Second, "how long dialing a backend may take")
 	headerTimeout := flag.Duration("header-timeout", 10*time.Second, "how long a connection may wait for its next request, and how long that request has to finish once it starts arriving")
 	responseTimeout := flag.Duration("response-timeout", 30*time.Second, "how long the whole exchange with a backend (request write plus response read) may take")
+	shutdownTimeout := flag.Duration("shutdown-timeout", 10*time.Second, "how long to wait for in-flight requests to finish on shutdown before forcing connections closed")
 	flag.Parse()
 
 	if *backendsFlag == "" {
@@ -36,7 +42,27 @@ func main() {
 		ResponseTimeout:     *responseTimeout,
 	}
 
-	if err := srv.ListenAndServe(); err != nil {
-		log.Fatalf("relayforge: %v", err)
+	serveErr := make(chan error, 1)
+	go func() {
+		serveErr <- srv.ListenAndServe()
+	}()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+
+	select {
+	case err := <-serveErr:
+		if err != nil && !errors.Is(err, proxy.ErrServerClosed) {
+			log.Fatalf("relayforge: %v", err)
+		}
+	case sig := <-sigCh:
+		log.Printf("relayforge: received %s, draining in-flight requests (up to %s)", sig, *shutdownTimeout)
+		ctx, cancel := context.WithTimeout(context.Background(), *shutdownTimeout)
+		defer cancel()
+		if err := srv.Shutdown(ctx); err != nil {
+			log.Printf("relayforge: shutdown timed out, forced remaining connections closed: %v", err)
+		} else {
+			log.Print("relayforge: shutdown complete, all connections drained")
+		}
 	}
 }

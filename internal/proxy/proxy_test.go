@@ -2,6 +2,8 @@ package proxy
 
 import (
 	"bufio"
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -1192,5 +1194,189 @@ func TestInvalidStrategyRejectedAtStartup(t *testing.T) {
 	}
 	if err := srv.Serve(ln); err == nil {
 		t.Fatal("expected Serve to reject an unrecognized strategy, got nil error")
+	}
+}
+
+func TestShutdownStopsAcceptingNewConnections(t *testing.T) {
+	backendLn := listenLoopback(t)
+	defer backendLn.Close()
+	rawHTTPBackend(t, backendLn, []string{canned200("ok")})
+
+	ln := listenLoopback(t)
+	srv := &Server{Backends: []string{backendLn.Addr().String()}}
+	go srv.Serve(ln)
+	proxyAddr := ln.Addr().String()
+
+	// Give Serve a moment to actually be listening before shutting down
+	// immediately.
+	time.Sleep(20 * time.Millisecond)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(ctx); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	if _, err := net.DialTimeout("tcp", proxyAddr, 1*time.Second); err == nil {
+		t.Fatal("expected dialing the proxy after Shutdown to fail, it succeeded")
+	}
+}
+
+// TestShutdownLetsInFlightRequestFinishThenClosesConnection is the
+// failure experiment this milestone is actually about: a request already
+// in flight against a slow backend should complete normally even though
+// shutdown starts while it's still running, and only once that finishes
+// does the (now idle) persistent connection get closed rather than kept
+// around for a request that may never come.
+func TestShutdownLetsInFlightRequestFinishThenClosesConnection(t *testing.T) {
+	backendLn := listenLoopback(t)
+	defer backendLn.Close()
+	go func() {
+		conn, req, err := acceptRealRequest(backendLn)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		io.Copy(io.Discard, req.Body)
+		time.Sleep(300 * time.Millisecond)
+		conn.Write([]byte(canned200("finished")))
+	}()
+
+	ln := listenLoopback(t)
+	srv := &Server{Backends: []string{backendLn.Addr().String()}}
+	go srv.Serve(ln)
+	proxyAddr := ln.Addr().String()
+
+	client, err := net.Dial("tcp", proxyAddr)
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer client.Close()
+	client.SetReadDeadline(time.Now().Add(3 * time.Second))
+	clientReader := bufio.NewReader(client)
+
+	if _, err := client.Write([]byte("GET / HTTP/1.1\r\nHost: test\r\n\r\n")); err != nil {
+		t.Fatalf("write request 1: %v", err)
+	}
+
+	// Give the proxy a moment to actually be mid-exchange with the slow
+	// backend before shutdown starts.
+	time.Sleep(50 * time.Millisecond)
+
+	shutdownErr := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		shutdownErr <- srv.Shutdown(ctx)
+	}()
+
+	if got, want := readOneResponse(t, clientReader), "finished"; got != want {
+		t.Fatalf("body = %q, want %q (in-flight request should finish during shutdown)", got, want)
+	}
+	if err := <-shutdownErr; err != nil {
+		t.Fatalf("Shutdown returned %v, want nil (should have waited for the in-flight request)", err)
+	}
+
+	// Shutdown having returned nil means every tracked connection,
+	// including this one, has already finished and closed. A bare read
+	// (no second write, writing onto a socket at the exact instant its
+	// peer closes is its own Windows-specific race that reports
+	// ECONNABORTED instead of a clean EOF) should find it already gone.
+	buf := make([]byte, 16)
+	_, err = clientReader.Read(buf)
+	if err != io.EOF {
+		t.Fatalf("got err %v, want io.EOF (connection should be closed once shutdown has completed)", err)
+	}
+}
+
+func TestShutdownForceClosesAfterDeadline(t *testing.T) {
+	backendLn := listenLoopback(t)
+	defer backendLn.Close()
+	go func() {
+		conn, req, err := acceptRealRequest(backendLn)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		io.Copy(io.Discard, req.Body)
+		// Never respond: this request is still in flight when
+		// Shutdown's deadline passes.
+		select {}
+	}()
+
+	ln := listenLoopback(t)
+	srv := &Server{
+		Backends:        []string{backendLn.Addr().String()},
+		ResponseTimeout: 10 * time.Second,
+	}
+	go srv.Serve(ln)
+	proxyAddr := ln.Addr().String()
+
+	client, err := net.Dial("tcp", proxyAddr)
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer client.Close()
+	if _, err := client.Write([]byte("GET / HTTP/1.1\r\nHost: test\r\n\r\n")); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	shutdownErr := srv.Shutdown(ctx)
+	elapsed := time.Since(start)
+
+	if !errors.Is(shutdownErr, context.DeadlineExceeded) {
+		t.Fatalf("Shutdown returned %v, want context.DeadlineExceeded", shutdownErr)
+	}
+	if elapsed > 1*time.Second {
+		t.Fatalf("Shutdown took %v to return after its deadline, want close to 200ms", elapsed)
+	}
+
+	client.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 16)
+	_, err = client.Read(buf)
+	if err != io.EOF {
+		t.Fatalf("got err %v, want io.EOF (stuck connection should be force-closed once Shutdown's deadline passes)", err)
+	}
+}
+
+func TestShutdownStopsHealthCheckGoroutine(t *testing.T) {
+	backendLn := listenLoopback(t)
+	defer backendLn.Close()
+
+	ln := listenLoopback(t)
+	srv := &Server{
+		Backends:            []string{backendLn.Addr().String()},
+		HealthCheckInterval: 10 * time.Millisecond,
+		HealthCheckTimeout:  50 * time.Millisecond,
+	}
+
+	runtime.Gosched()
+	time.Sleep(20 * time.Millisecond)
+	before := runtime.NumGoroutine()
+
+	go srv.Serve(ln)
+	time.Sleep(50 * time.Millisecond) // let it probe at least once
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(ctx); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	deadline := time.Now().Add(1 * time.Second)
+	for {
+		runtime.Gosched()
+		current := runtime.NumGoroutine()
+		if current <= before {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("goroutine count did not return to baseline after Shutdown: before=%d, still=%d", before, current)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
