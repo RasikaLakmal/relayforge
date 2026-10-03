@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"runtime"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -1046,5 +1048,149 @@ func TestClientDisconnectCancelsSlowBackendWork(t *testing.T) {
 			t.Fatalf("goroutine count did not return to baseline after cancellation: before=%d, still=%d", before, current)
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// delayedBackend accepts connections concurrently (unlike rawHTTPBackend,
+// which serves one request at a time), and for each one waits delay
+// before answering with a body of label. hits counts how many requests
+// actually reached it, used to measure how a load-balancing strategy
+// distributed work across backends of different speed. Each response
+// says Connection: close, matching what this fake actually does (closes
+// the connection right after responding, it isn't a keep-alive server),
+// so the proxy doesn't pool a connection this fake has already hung up
+// on.
+func delayedBackend(t *testing.T, ln net.Listener, delay time.Duration, label string, hits *int64) {
+	t.Helper()
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer conn.Close()
+				req, err := http.ReadRequest(bufio.NewReader(conn))
+				if err != nil {
+					return
+				}
+				io.Copy(io.Discard, req.Body)
+				atomic.AddInt64(hits, 1)
+				time.Sleep(delay)
+				resp := fmt.Sprintf("HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", len(label), label)
+				conn.Write([]byte(resp))
+			}(conn)
+		}
+	}()
+}
+
+// TestLeastConnectionsFavorsFasterBackend is the reason this strategy
+// exists as an alternative to round robin: under uneven backend cost,
+// round robin would split load exactly 50/50 regardless of how long each
+// backend takes, but least-connections should notice the slow backend is
+// still busy and route more of a concurrent burst to the faster one.
+func TestLeastConnectionsFavorsFasterBackend(t *testing.T) {
+	slowLn := listenLoopback(t)
+	defer slowLn.Close()
+	var slowHits int64
+	delayedBackend(t, slowLn, 150*time.Millisecond, "slow", &slowHits)
+
+	fastLn := listenLoopback(t)
+	defer fastLn.Close()
+	var fastHits int64
+	delayedBackend(t, fastLn, 5*time.Millisecond, "fast", &fastHits)
+
+	ln := listenLoopback(t)
+	srv := &Server{
+		Backends: []string{slowLn.Addr().String(), fastLn.Addr().String()},
+		Strategy: StrategyLeastConnections,
+	}
+	go srv.Serve(ln)
+	t.Cleanup(func() { ln.Close() })
+	proxyAddr := ln.Addr().String()
+
+	var wg sync.WaitGroup
+	const n = 20
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			client, err := net.Dial("tcp", proxyAddr)
+			if err != nil {
+				return
+			}
+			defer client.Close()
+			client.SetReadDeadline(time.Now().Add(3 * time.Second))
+			if _, err := client.Write([]byte("GET / HTTP/1.1\r\nHost: test\r\n\r\n")); err != nil {
+				return
+			}
+			resp, err := http.ReadResponse(bufio.NewReader(client), &http.Request{Method: "GET"})
+			if err != nil {
+				return
+			}
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}()
+		time.Sleep(2 * time.Millisecond)
+	}
+	wg.Wait()
+
+	if fastHits <= slowHits {
+		t.Fatalf("expected least-connections to favor the faster backend under concurrent load, got slow=%d fast=%d", slowHits, fastHits)
+	}
+}
+
+func TestLeastConnectionsSkipsUnhealthyBackend(t *testing.T) {
+	aliveLn := listenLoopback(t)
+	defer aliveLn.Close()
+	responses := make([]string, 10)
+	for i := range responses {
+		responses[i] = canned200("alive")
+	}
+	rawHTTPBackend(t, aliveLn, responses)
+
+	deadLn := listenLoopback(t)
+	deadAddr := deadLn.Addr().String()
+	deadLn.Close()
+
+	ln := listenLoopback(t)
+	srv := &Server{
+		Backends:            []string{aliveLn.Addr().String(), deadAddr},
+		Strategy:            StrategyLeastConnections,
+		HealthCheckInterval: 10 * time.Millisecond,
+		HealthCheckTimeout:  50 * time.Millisecond,
+	}
+	go srv.Serve(ln)
+	t.Cleanup(func() { ln.Close() })
+	proxyAddr := ln.Addr().String()
+
+	deadline := time.Now().Add(3 * time.Second)
+	consecutive := 0
+	for consecutive < 5 {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for health checks to converge, got %d consecutive successes", consecutive)
+		}
+		body, ok := requestSucceeds(proxyAddr)
+		if !ok {
+			consecutive = 0
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+		if body != "alive" {
+			t.Fatalf("body = %q, want %q", body, "alive")
+		}
+		consecutive++
+	}
+}
+
+func TestInvalidStrategyRejectedAtStartup(t *testing.T) {
+	ln := listenLoopback(t)
+	defer ln.Close()
+	srv := &Server{
+		Backends: []string{"127.0.0.1:1"},
+		Strategy: "some-made-up-strategy",
+	}
+	if err := srv.Serve(ln); err == nil {
+		t.Fatal("expected Serve to reject an unrecognized strategy, got nil error")
 	}
 }

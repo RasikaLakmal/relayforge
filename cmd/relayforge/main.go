@@ -12,7 +12,8 @@ import (
 
 func main() {
 	listenAddr := flag.String("listen", ":8080", "address to listen on")
-	backendsFlag := flag.String("backends", "", "comma-separated list of backend addresses to round-robin across")
+	backendsFlag := flag.String("backends", "", "comma-separated list of backend addresses to load-balance across")
+	strategy := flag.String("strategy", proxy.StrategyRoundRobin, "load-balancing strategy: round-robin or least-connections")
 	healthInterval := flag.Duration("health-interval", 5*time.Second, "how often to probe each backend")
 	healthTimeout := flag.Duration("health-timeout", 2*time.Second, "how long a single health probe waits to connect")
 	connectTimeout := flag.Duration("connect-timeout", 3*time.Second, "how long dialing a backend may take")
@@ -27,6 +28,7 @@ func main() {
 	srv := &proxy.Server{
 		ListenAddr:          *listenAddr,
 		Backends:            strings.Split(*backendsFlag, ","),
+		Strategy:            *strategy,
 		HealthCheckInterval: *healthInterval,
 		HealthCheckTimeout:  *healthTimeout,
 		ConnectTimeout:      *connectTimeout,

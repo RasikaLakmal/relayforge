@@ -10,6 +10,7 @@ package proxy
 import (
 	"bufio"
 	"errors"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -34,18 +35,34 @@ const (
 
 var errNoHealthyBackends = errors.New("no healthy backends available")
 
-// Server forwards every request to one of Backends, chosen in round-robin
-// order among whichever of them the periodic health check currently
-// considers reachable. A backend is assumed healthy until the first check
-// says otherwise, so nothing is taken out of rotation before it has
-// actually been probed. A backend connection that finishes a request
-// cleanly (no error, no Connection: close) is kept idle and reused by a
-// later request to the same backend rather than being dialed again from
-// scratch, regardless of which client connection that later request
-// arrives on.
+// Load-balancing strategies recognized by Server.Strategy. The empty
+// string is treated as StrategyRoundRobin.
+const (
+	StrategyRoundRobin       = "round-robin"
+	StrategyLeastConnections = "least-connections"
+)
+
+// Server forwards every request to one of Backends, chosen by Strategy
+// among whichever of them the periodic health check currently considers
+// reachable. A backend is assumed healthy until the first check says
+// otherwise, so nothing is taken out of rotation before it has actually
+// been probed. A backend connection that finishes a request cleanly (no
+// error, no Connection: close) is kept idle and reused by a later request
+// to the same backend rather than being dialed again from scratch,
+// regardless of which client connection that later request arrives on.
 type Server struct {
 	ListenAddr string
 	Backends   []string
+
+	// Strategy picks how a backend is selected for each request.
+	// StrategyRoundRobin (the default, used if left empty) cycles
+	// through backends in order. StrategyLeastConnections picks
+	// whichever healthy backend currently has the fewest in-flight
+	// requests, kept as a second, comparable strategy specifically so
+	// the two can be benchmarked against each other under uneven request
+	// costs, not because either is assumed better. Any other value is
+	// rejected at Serve time.
+	Strategy string
 
 	// HealthCheckInterval is how often each backend is probed. Zero uses
 	// defaultHealthCheckInterval.
@@ -69,6 +86,7 @@ type Server struct {
 
 	next    uint64
 	healthy []atomic.Bool
+	active  []int64 // in-flight request count per backend, for least-connections
 
 	idleMu sync.Mutex
 	idle   map[string][]net.Conn
@@ -92,16 +110,26 @@ func (s *Server) Serve(ln net.Listener) error {
 	if len(s.Backends) == 0 {
 		return errors.New("relayforge: at least one backend is required")
 	}
+	switch s.Strategy {
+	case "", StrategyRoundRobin, StrategyLeastConnections:
+	default:
+		return fmt.Errorf("relayforge: unrecognized strategy %q", s.Strategy)
+	}
 
 	s.healthy = make([]atomic.Bool, len(s.Backends))
 	for i := range s.healthy {
 		s.healthy[i].Store(true)
 	}
+	s.active = make([]int64, len(s.Backends))
 	s.idle = make(map[string][]net.Conn)
 	go s.probeAllBackends()
 	go s.runHealthChecks()
 
-	log.Printf("relayforge: listening on %s, backends=%v (round robin)", ln.Addr(), s.Backends)
+	strategy := s.Strategy
+	if strategy == "" {
+		strategy = StrategyRoundRobin
+	}
+	log.Printf("relayforge: listening on %s, backends=%v (%s)", ln.Addr(), s.Backends, strategy)
 
 	for {
 		conn, err := ln.Accept()
@@ -161,18 +189,54 @@ func (s *Server) probeBackend(idx int, addr string) {
 	}
 }
 
-// nextBackend picks the next healthy backend address in round-robin
-// order. It reports false if every backend currently looks unhealthy, in
-// which case there is nothing to route to.
-func (s *Server) nextBackend() (string, bool) {
+// pickBackend selects a backend address and its index according to
+// s.Strategy. It reports false if every backend currently looks
+// unhealthy, in which case there is nothing to route to.
+func (s *Server) pickBackend() (addr string, idx int, ok bool) {
+	if s.Strategy == StrategyLeastConnections {
+		return s.pickLeastConnections()
+	}
+	return s.pickRoundRobin()
+}
+
+// pickRoundRobin cycles through backends in order, skipping unhealthy
+// ones.
+func (s *Server) pickRoundRobin() (string, int, bool) {
 	n := len(s.Backends)
 	for i := 0; i < n; i++ {
-		idx := (atomic.AddUint64(&s.next, 1) - 1) % uint64(n)
+		idx := int((atomic.AddUint64(&s.next, 1) - 1) % uint64(n))
 		if s.healthy[idx].Load() {
-			return s.Backends[idx], true
+			return s.Backends[idx], idx, true
 		}
 	}
-	return "", false
+	return "", -1, false
+}
+
+// pickLeastConnections picks whichever healthy backend currently has the
+// fewest in-flight requests. The scan starts from a rotating offset (the
+// same counter round robin uses) rather than always from index 0, so that
+// ties, which are common when load is light or every backend is equally
+// fast, are broken fairly across backends instead of always favoring
+// whichever comes first in the list.
+func (s *Server) pickLeastConnections() (string, int, bool) {
+	n := len(s.Backends)
+	start := int((atomic.AddUint64(&s.next, 1) - 1) % uint64(n))
+	bestIdx := -1
+	var bestCount int64
+	for i := 0; i < n; i++ {
+		idx := (start + i) % n
+		if !s.healthy[idx].Load() {
+			continue
+		}
+		count := atomic.LoadInt64(&s.active[idx])
+		if bestIdx == -1 || count < bestCount {
+			bestIdx, bestCount = idx, count
+		}
+	}
+	if bestIdx == -1 {
+		return "", -1, false
+	}
+	return s.Backends[bestIdx], bestIdx, true
 }
 
 // takeIdleConn returns a pooled, idle connection to addr if one is
@@ -369,12 +433,19 @@ func retryEligible(req *http.Request, a attempt) bool {
 }
 
 // attemptOnce picks a backend, obtains a connection to it (pooled or
-// freshly dialed), and runs the full request/response exchange once.
+// freshly dialed), and runs the full request/response exchange once. The
+// chosen backend's active count is incremented for the duration of the
+// exchange (not including writing the response back to the client, which
+// is no longer backend-side work), so StrategyLeastConnections sees a
+// request as "in flight" for exactly as long as a backend is actually
+// doing something on its behalf.
 func (s *Server) attemptOnce(client net.Conn, clientReader *bufio.Reader, req *http.Request) attempt {
-	backendAddr, ok := s.nextBackend()
+	backendAddr, idx, ok := s.pickBackend()
 	if !ok {
 		return attempt{err: errNoHealthyBackends}
 	}
+	atomic.AddInt64(&s.active[idx], 1)
+	defer atomic.AddInt64(&s.active[idx], -1)
 
 	backend := s.takeIdleConn(backendAddr)
 	reused := backend != nil
