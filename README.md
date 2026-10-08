@@ -2,7 +2,7 @@
 
 TCP reverse proxy and load balancer in Go, built from scratch to actually understand connection handling, HTTP framing, load balancing, connection pooling, and backpressure rather than configuring nginx/HAProxy/Traefik and trusting the magic.
 
-Part of a personal [engineering lab](../../checklist.md) of systems-depth projects, following [VellumDB](../vellumdb).
+Part of a personal engineering lab of systems-depth projects.
 
 ## What's here
 
@@ -18,6 +18,7 @@ Part of a personal [engineering lab](../../checklist.md) of systems-depth projec
 - **Graceful shutdown**: on `SIGINT`/`SIGTERM`, the proxy stops accepting new connections immediately but lets whatever request is currently in flight on each existing connection finish normally before closing it, rather than cutting every open connection on the spot. A persistent connection that's already idle, waiting for its next request, is not forcibly interrupted, but will not be served again once it finishes whatever it's doing; a bounded grace period (`-shutdown-timeout`) forces anything still open closed if draining takes too long, so the process always actually exits.
 - **Backpressure**: `-max-connections` bounds how many client connections may be open at once, accepting no further ones (letting them queue in the OS's own listen backlog instead) once at capacity. `-max-in-flight` separately bounds how many requests may be concurrently in flight to backends across all connections combined; a request past that limit gets an immediate, explicit 503 rather than being queued or silently left to pile up. Both are opt-in (zero means unbounded) since the right numbers depend on real capacity testing, not a guess.
 - **Metrics**: `-metrics-listen` serves hand-written Prometheus text format at `/metrics` on its own address, separate from proxied traffic so a backend's own routes can never collide with it. Covers aggregate request/retry/rejection counters, active connection and in-flight gauges, and per-backend request/error counts, health state, and average latency (a sum and count, not a real histogram with percentiles, that's a deliberate simplification until there's a reason for real buckets).
+- **Config file and reload**: `-config` points at a JSON file instead of individual flags, validated up front (malformed backend addresses, duplicate backends, an unrecognized strategy, a non-positive duration, a negative count all fail startup immediately with a clear error rather than starting up broken). On `SIGHUP`, the file is re-read, re-validated, and swapped into the running server without dropping any in-flight request: `Backends`, `Strategy`, the health-check settings, the timeouts, and `MaxInFlight` all take effect immediately; a backend address that is still present afterward keeps its existing health state and accumulated metrics rather than resetting. `ListenAddr`, `MetricsListenAddr`, and `MaxConnections` are not reloadable, changing where or how many connections are accepted needs a new listener, which is a restart, not a reload.
 
 ## Usage
 
@@ -37,9 +38,36 @@ Send `SIGINT` (Ctrl+C) or `SIGTERM` to shut down gracefully: in-flight requests 
 
 Every request is forwarded to one of `-backends`, chosen by `-strategy` (`round-robin` or `least-connections`) among whichever of them the health checker currently considers reachable.
 
+### Config file
+
+```
+go build -o relayforge ./cmd/relayforge
+./relayforge -config relayforge.json
+```
+
+```json
+{
+  "listen": "127.0.0.1:8080",
+  "backends": ["127.0.0.1:9090", "127.0.0.1:9091"],
+  "strategy": "least-connections",
+  "health_interval": "5s",
+  "health_timeout": "2s",
+  "connect_timeout": "3s",
+  "header_timeout": "10s",
+  "response_timeout": "30s",
+  "shutdown_timeout": "10s",
+  "max_connections": 1000,
+  "max_in_flight": 200,
+  "metrics_listen": "127.0.0.1:9100"
+}
+```
+
+If `-config` is set, every other flag is ignored, settings come entirely from the file. Every field is optional except `listen` and `backends`; anything else left out uses the same built-in default as its flag would. Sending `SIGHUP` re-reads and re-validates the file and reloads `backends`, `strategy`, the health-check settings, the timeouts, and `max_in_flight` into the running server without dropping any in-flight request; an invalid file at reload time is rejected and the server keeps running on its existing configuration rather than being torn down by a typo.
+
 ## Known limitations
 
-- No config file yet, backends are a flag-supplied comma-separated list.
+- `SIGHUP` is a POSIX signal with no real Windows OS equivalent; Go only wires actual console events (Ctrl+C-style) to `os.Interrupt` on Windows, not `SIGHUP`. The reload trigger is effectively untestable, and likely unusable, on Windows even though the code compiles there; it was verified directly via `Server.Reload` in Go tests instead of via a real delivered signal.
+- `Reload` assumes the server has already finished starting. Calling it concurrently with `Serve`'s own startup (before the first backend/config snapshot is published) could have its changes clobbered by `Serve`'s belated initialization. Not a realistic concern in practice, a reload presupposes an already-running server, but it is not actively guarded against either.
 - Health checks are a plain TCP connect, not an HTTP-level check against a real health endpoint, and they run on a fixed interval rather than reacting to a request that actually failed. A backend that dies between two probes still gets picked and fails whatever request lands on it until the next probe catches it.
 - If every backend is currently unhealthy, a request simply fails, there is nothing to fall back to.
 - The idle pool per backend is capped at a fixed 8 connections, not configurable yet, there is no benchmark yet that would justify exposing it as a flag.
@@ -65,6 +93,6 @@ Every request is forwarded to one of `-backends`, chosen by `-strategy` (`round-
 go test ./...
 ```
 
-Covers: a single request/response round trip through the proxy, a chunked response body reassembled correctly, two requests carried over one persistent connection, a connection torn down after a `Connection: close` response, a malformed request rejected cleanly instead of hanging the proxy, the client connection closed cleanly when a backend dial fails, requests round-robining across backends in the correct order over a single persistent connection, a dead backend getting routed around once health checks converge, a backend rejoining rotation after it recovers, every backend being unhealthy failing requests cleanly, health checks being periodic rather than catching a backend the instant it dies, a backend connection actually being reused across three separate client connections, a `Connection: close` response never being pooled, a stale pooled connection being retried transparently, a request with a body never being retried even on an otherwise-eligible stale connection, an idempotent request being retried against a different backend after one fails to respond, a non-idempotent request never being retried in that same situation, the connect timeout actually applying to a hanging dial, an idle connection past the header timeout being closed, a hanging backend failing after the response timeout, a client disconnecting mid-request cancelling the backend work with no goroutine leak, least-connections favoring a faster backend under a concurrent burst against a slower one, least-connections skipping an unhealthy backend, an unrecognized strategy being rejected at startup, shutdown refusing new connections immediately, an in-flight request finishing successfully during shutdown before its now-idle connection closes, a stuck request being force-closed once the shutdown deadline passes, the health-check goroutine actually stopping after shutdown instead of leaking, a burst of requests past `-max-in-flight` getting 503s for the excess while the rest succeed, a connection attempted past `-max-connections` getting no response until an existing one closes and frees a slot, the metrics endpoint reporting accurate aggregate and per-backend request counts, a retry showing up in `relayforge_retries_total`, and a rejection showing up in `relayforge_rejected_total`.
+Covers: a single request/response round trip through the proxy, a chunked response body reassembled correctly, two requests carried over one persistent connection, a connection torn down after a `Connection: close` response, a malformed request rejected cleanly instead of hanging the proxy, the client connection closed cleanly when a backend dial fails, requests round-robining across backends in the correct order over a single persistent connection, a dead backend getting routed around once health checks converge, a backend rejoining rotation after it recovers, every backend being unhealthy failing requests cleanly, health checks being periodic rather than catching a backend the instant it dies, a backend connection actually being reused across three separate client connections, a `Connection: close` response never being pooled, a stale pooled connection being retried transparently, a request with a body never being retried even on an otherwise-eligible stale connection, an idempotent request being retried against a different backend after one fails to respond, a non-idempotent request never being retried in that same situation, the connect timeout actually applying to a hanging dial, an idle connection past the header timeout being closed, a hanging backend failing after the response timeout, a client disconnecting mid-request cancelling the backend work with no goroutine leak, least-connections favoring a faster backend under a concurrent burst against a slower one, least-connections skipping an unhealthy backend, an unrecognized strategy being rejected at startup, shutdown refusing new connections immediately, an in-flight request finishing successfully during shutdown before its now-idle connection closes, a stuck request being force-closed once the shutdown deadline passes, the health-check goroutine actually stopping after shutdown instead of leaking, a burst of requests past `-max-in-flight` getting 503s for the excess while the rest succeed, a connection attempted past `-max-connections` getting no response until an existing one closes and frees a slot, the metrics endpoint reporting accurate aggregate and per-backend request counts, a retry showing up in `relayforge_retries_total`, a rejection showing up in `relayforge_rejected_total`, a reload not disturbing a request already in flight, a reload preserving an unchanged backend's accumulated state, invalid reload configuration being rejected, `max_in_flight` taking effect immediately after a reload, and a shortened health-check interval taking effect immediately after a reload rather than waiting for the old interval's own schedule. `cmd/relayforge` has its own tests for config file loading and validation: a valid file resolves correctly, a missing file and malformed JSON are both rejected, and each individual validation rule (bad backend address, duplicate backend, bad strategy, bad or non-positive duration, negative counts) is rejected on its own.
 
 A separate benchmark comparing round robin against least-connections under uneven backend cost, with real numbers instead of the qualitative demonstration above, belongs in milestone 11.

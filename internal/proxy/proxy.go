@@ -21,7 +21,7 @@ import (
 	"time"
 )
 
-// Defaults applied whenever the corresponding Server field is left at
+// Defaults applied whenever the corresponding config value is left at
 // zero. maxIdleConnsPerBackend bounds how many idle backend connections
 // are kept around per backend; it is a fixed constant rather than a flag
 // for now, there is no benchmark yet that would justify exposing it as
@@ -57,6 +57,15 @@ const (
 // error, no Connection: close) is kept idle and reused by a later request
 // to the same backend rather than being dialed again from scratch,
 // regardless of which client connection that later request arrives on.
+//
+// Backends, Strategy, the health-check settings, the timeouts, and
+// MaxInFlight can all be changed on a running server with Reload, without
+// dropping any in-flight request: each already holds its own reference to
+// the backend it is talking to, independent of whatever the current
+// configuration looks like by the time it finishes. ListenAddr,
+// MetricsListenAddr, and MaxConnections cannot: changing where or how
+// many connections are accepted needs a new listener, which is a
+// restart, not a reload.
 type Server struct {
 	ListenAddr string
 	Backends   []string
@@ -116,12 +125,23 @@ type Server struct {
 	// and metrics scraping is never mixed in with proxied traffic.
 	MetricsListenAddr string
 
-	next     uint64
-	healthy  []atomic.Bool
-	active   []int64 // in-flight request count per backend, for least-connections
-	inFlight int64   // in-flight request count across all backends, for MaxInFlight
+	next uint64
 
-	backendStats  []backendStats
+	// backends is the live, swappable set of backends. Serve populates it
+	// from the Backends field above; Reload atomically replaces it.
+	// Everything after startup reads through this, never through the
+	// Backends field directly, so a reload can never desync a backend's
+	// address from its health/active/stats state the way parallel slices
+	// indexed by position would.
+	backends atomic.Pointer[[]*backendState]
+	// live holds the hot-reloadable scalar settings (Strategy, the
+	// timeouts, MaxInFlight). Reads go through this, not the struct
+	// fields directly, so Reload can replace them with a single atomic
+	// store instead of mutating fields concurrent readers might be
+	// examining mid-request.
+	live atomic.Pointer[liveConfig]
+
+	inFlight      int64 // in-flight request count across all backends, for MaxInFlight
 	totalRequests int64
 	totalRetries  int64
 	totalRejected int64
@@ -142,6 +162,20 @@ type Server struct {
 	listener net.Listener
 }
 
+// backendState holds everything specific to one backend: its address,
+// current health, in-flight count, and accumulated stats. Referenced by
+// pointer from the slice Server.backends points to, so a Reload that
+// keeps an address can hand the new slice the very same *backendState,
+// carrying its health/active/stats forward untouched, while a brand new
+// address starts a fresh one (assumed healthy, zero stats, exactly like
+// startup).
+type backendState struct {
+	addr    string
+	healthy atomic.Bool
+	active  int64 // in-flight request count for this backend, for least-connections
+	stats   backendStats
+}
+
 // backendStats accumulates per-backend counters, all updated with atomics
 // so they can be read concurrently with ongoing requests without a lock.
 // durationNanosSum/durationCount together give an average latency, not a
@@ -153,6 +187,35 @@ type backendStats struct {
 	errors           int64
 	durationNanosSum int64
 	durationCount    int64
+}
+
+// liveConfig is the hot-reloadable subset of Server's configuration,
+// published as a single immutable snapshot so readers never see a
+// half-updated mix of old and new values.
+type liveConfig struct {
+	strategy            string
+	healthCheckInterval time.Duration
+	healthCheckTimeout  time.Duration
+	connectTimeout      time.Duration
+	headerTimeout       time.Duration
+	responseTimeout     time.Duration
+	maxInFlight         int
+}
+
+// ReloadableConfig holds the subset of Server's configuration that can be
+// changed on a running server via Reload without dropping traffic.
+// ListenAddr, MetricsListenAddr, and MaxConnections are deliberately not
+// included: changing where or how many connections are accepted needs a
+// new listener, which is a restart, not a reload.
+type ReloadableConfig struct {
+	Backends            []string
+	Strategy            string
+	HealthCheckInterval time.Duration
+	HealthCheckTimeout  time.Duration
+	ConnectTimeout      time.Duration
+	HeaderTimeout       time.Duration
+	ResponseTimeout     time.Duration
+	MaxInFlight         int
 }
 
 // ListenAndServe opens ListenAddr and serves it until Accept fails.
@@ -179,12 +242,24 @@ func (s *Server) Serve(ln net.Listener) error {
 		return fmt.Errorf("relayforge: unrecognized strategy %q", s.Strategy)
 	}
 
-	s.healthy = make([]atomic.Bool, len(s.Backends))
-	for i := range s.healthy {
-		s.healthy[i].Store(true)
+	initial := make([]*backendState, len(s.Backends))
+	for i, addr := range s.Backends {
+		bs := &backendState{addr: addr}
+		bs.healthy.Store(true)
+		initial[i] = bs
 	}
-	s.active = make([]int64, len(s.Backends))
-	s.backendStats = make([]backendStats, len(s.Backends))
+	s.backends.Store(&initial)
+
+	s.live.Store(&liveConfig{
+		strategy:            s.Strategy,
+		healthCheckInterval: s.HealthCheckInterval,
+		healthCheckTimeout:  s.HealthCheckTimeout,
+		connectTimeout:      s.ConnectTimeout,
+		headerTimeout:       s.HeaderTimeout,
+		responseTimeout:     s.ResponseTimeout,
+		maxInFlight:         s.MaxInFlight,
+	})
+
 	s.idle = make(map[string][]net.Conn)
 	s.conns = make(map[net.Conn]struct{})
 	s.shutdownCh = make(chan struct{})
@@ -234,6 +309,72 @@ func (s *Server) Serve(ln net.Listener) error {
 			s.handleConn(conn)
 		}()
 	}
+}
+
+// Reload atomically swaps in new configuration for a running server,
+// without dropping any in-flight request. A backend address that was
+// already present keeps its existing health state, in-flight count, and
+// accumulated metrics; a reload does not reset backend state wholesale
+// just because it touched something else. A brand new address starts out
+// assumed healthy with zero stats, exactly like at startup. An address
+// that is no longer listed is simply dropped from future selection, any
+// request already in flight against it keeps its own reference to that
+// backend's state regardless, so it finishes exactly as if nothing had
+// changed.
+func (s *Server) Reload(cfg ReloadableConfig) error {
+	switch cfg.Strategy {
+	case "", StrategyRoundRobin, StrategyLeastConnections:
+	default:
+		return fmt.Errorf("relayforge: unrecognized strategy %q", cfg.Strategy)
+	}
+	if len(cfg.Backends) == 0 {
+		return errors.New("relayforge: at least one backend is required")
+	}
+	seen := make(map[string]bool, len(cfg.Backends))
+	for _, addr := range cfg.Backends {
+		if seen[addr] {
+			return fmt.Errorf("relayforge: duplicate backend %q", addr)
+		}
+		seen[addr] = true
+	}
+
+	oldByAddr := make(map[string]*backendState)
+	if old := s.backends.Load(); old != nil {
+		for _, bs := range *old {
+			oldByAddr[bs.addr] = bs
+		}
+	}
+
+	newList := make([]*backendState, len(cfg.Backends))
+	for i, addr := range cfg.Backends {
+		if existing, ok := oldByAddr[addr]; ok {
+			newList[i] = existing
+			continue
+		}
+		bs := &backendState{addr: addr}
+		bs.healthy.Store(true)
+		newList[i] = bs
+	}
+
+	s.backends.Store(&newList)
+	s.live.Store(&liveConfig{
+		strategy:            cfg.Strategy,
+		healthCheckInterval: cfg.HealthCheckInterval,
+		healthCheckTimeout:  cfg.HealthCheckTimeout,
+		connectTimeout:      cfg.ConnectTimeout,
+		headerTimeout:       cfg.HeaderTimeout,
+		responseTimeout:     cfg.ResponseTimeout,
+		maxInFlight:         cfg.MaxInFlight,
+	})
+	s.Backends = cfg.Backends
+	s.Strategy = cfg.Strategy
+
+	strategy := cfg.Strategy
+	if strategy == "" {
+		strategy = StrategyRoundRobin
+	}
+	log.Printf("relayforge: reloaded configuration, backends=%v (%s)", cfg.Backends, strategy)
+	return nil
 }
 
 // Shutdown stops accepting new connections and waits for in-flight
@@ -357,29 +498,45 @@ func (s *Server) serveMetrics(w http.ResponseWriter, r *http.Request) {
 	b.WriteString("# TYPE relayforge_backend_request_duration_seconds_sum counter\n")
 	b.WriteString("# HELP relayforge_backend_request_duration_seconds_count Requests to this backend with a recorded duration.\n")
 	b.WriteString("# TYPE relayforge_backend_request_duration_seconds_count counter\n")
-	for i, addr := range s.Backends {
+	for _, bs := range s.loadBackends() {
 		up := 0
-		if s.healthy[i].Load() {
+		if bs.healthy.Load() {
 			up = 1
 		}
-		stats := &s.backendStats[i]
-		fmt.Fprintf(&b, "relayforge_backend_up{backend=%q} %d\n", addr, up)
-		fmt.Fprintf(&b, "relayforge_backend_requests_total{backend=%q} %d\n", addr, atomic.LoadInt64(&stats.requests))
-		fmt.Fprintf(&b, "relayforge_backend_errors_total{backend=%q} %d\n", addr, atomic.LoadInt64(&stats.errors))
-		fmt.Fprintf(&b, "relayforge_backend_active_requests{backend=%q} %d\n", addr, atomic.LoadInt64(&s.active[i]))
-		seconds := float64(atomic.LoadInt64(&stats.durationNanosSum)) / 1e9
-		fmt.Fprintf(&b, "relayforge_backend_request_duration_seconds_sum{backend=%q} %g\n", addr, seconds)
-		fmt.Fprintf(&b, "relayforge_backend_request_duration_seconds_count{backend=%q} %d\n", addr, atomic.LoadInt64(&stats.durationCount))
+		fmt.Fprintf(&b, "relayforge_backend_up{backend=%q} %d\n", bs.addr, up)
+		fmt.Fprintf(&b, "relayforge_backend_requests_total{backend=%q} %d\n", bs.addr, atomic.LoadInt64(&bs.stats.requests))
+		fmt.Fprintf(&b, "relayforge_backend_errors_total{backend=%q} %d\n", bs.addr, atomic.LoadInt64(&bs.stats.errors))
+		fmt.Fprintf(&b, "relayforge_backend_active_requests{backend=%q} %d\n", bs.addr, atomic.LoadInt64(&bs.active))
+		seconds := float64(atomic.LoadInt64(&bs.stats.durationNanosSum)) / 1e9
+		fmt.Fprintf(&b, "relayforge_backend_request_duration_seconds_sum{backend=%q} %g\n", bs.addr, seconds)
+		fmt.Fprintf(&b, "relayforge_backend_request_duration_seconds_count{backend=%q} %d\n", bs.addr, atomic.LoadInt64(&bs.stats.durationCount))
 	}
 
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 	w.Write([]byte(b.String()))
 }
 
-// runHealthChecks probes every backend on a fixed interval until Shutdown
-// closes shutdownCh.
+// loadBackends returns the current backend list. Safe to call concurrently
+// with Reload: the returned slice is a stable snapshot that Reload never
+// mutates in place, it only ever publishes a new one.
+func (s *Server) loadBackends() []*backendState {
+	p := s.backends.Load()
+	if p == nil {
+		return nil
+	}
+	return *p
+}
+
+func (s *Server) liveCfg() *liveConfig {
+	return s.live.Load()
+}
+
+// runHealthChecks probes every backend on an interval until Shutdown
+// closes shutdownCh. The interval is re-read after every tick so a Reload
+// that changes HealthCheckInterval takes effect on the next tick rather
+// than only after a restart.
 func (s *Server) runHealthChecks() {
-	interval := s.HealthCheckInterval
+	interval := s.liveCfg().healthCheckInterval
 	if interval <= 0 {
 		interval = defaultHealthCheckInterval
 	}
@@ -389,6 +546,16 @@ func (s *Server) runHealthChecks() {
 		select {
 		case <-ticker.C:
 			s.probeAllBackends()
+			if next := s.liveCfg().healthCheckInterval; next <= 0 {
+				next = defaultHealthCheckInterval
+				if next != interval {
+					interval = next
+					ticker.Reset(interval)
+				}
+			} else if next != interval {
+				interval = next
+				ticker.Reset(interval)
+			}
 		case <-s.shutdownCh:
 			return
 		}
@@ -396,8 +563,8 @@ func (s *Server) runHealthChecks() {
 }
 
 func (s *Server) probeAllBackends() {
-	for i, addr := range s.Backends {
-		go s.probeBackend(i, addr)
+	for _, bs := range s.loadBackends() {
+		go s.probeBackend(bs)
 	}
 }
 
@@ -405,50 +572,54 @@ func (s *Server) probeAllBackends() {
 // simplest available signal that something is listening. It does not
 // speak HTTP to the backend, an application-level health endpoint is a
 // choice for a config-driven future milestone, not this one.
-func (s *Server) probeBackend(idx int, addr string) {
-	timeout := s.HealthCheckTimeout
+func (s *Server) probeBackend(bs *backendState) {
+	timeout := s.liveCfg().healthCheckTimeout
 	if timeout <= 0 {
 		timeout = defaultHealthCheckTimeout
 	}
 
-	conn, err := net.DialTimeout("tcp", addr, timeout)
+	conn, err := net.DialTimeout("tcp", bs.addr, timeout)
 	isHealthy := err == nil
 	if conn != nil {
 		conn.Close()
 	}
 
-	wasHealthy := s.healthy[idx].Swap(isHealthy)
+	wasHealthy := bs.healthy.Swap(isHealthy)
 	if wasHealthy == isHealthy {
 		return
 	}
 	if isHealthy {
-		log.Printf("relayforge: backend %s passed its health check, back in rotation", addr)
+		log.Printf("relayforge: backend %s passed its health check, back in rotation", bs.addr)
 	} else {
-		log.Printf("relayforge: backend %s failed its health check, taking it out of rotation", addr)
+		log.Printf("relayforge: backend %s failed its health check, taking it out of rotation", bs.addr)
 	}
 }
 
-// pickBackend selects a backend address and its index according to
-// s.Strategy. It reports false if every backend currently looks
-// unhealthy, in which case there is nothing to route to.
-func (s *Server) pickBackend() (addr string, idx int, ok bool) {
-	if s.Strategy == StrategyLeastConnections {
-		return s.pickLeastConnections()
+// pickBackend selects a backend according to the current strategy. It
+// reports false if every backend currently looks unhealthy, in which case
+// there is nothing to route to.
+func (s *Server) pickBackend() (*backendState, bool) {
+	list := s.loadBackends()
+	if len(list) == 0 {
+		return nil, false
 	}
-	return s.pickRoundRobin()
+	if s.liveCfg().strategy == StrategyLeastConnections {
+		return s.pickLeastConnections(list)
+	}
+	return s.pickRoundRobin(list)
 }
 
 // pickRoundRobin cycles through backends in order, skipping unhealthy
 // ones.
-func (s *Server) pickRoundRobin() (string, int, bool) {
-	n := len(s.Backends)
+func (s *Server) pickRoundRobin(list []*backendState) (*backendState, bool) {
+	n := len(list)
 	for i := 0; i < n; i++ {
 		idx := int((atomic.AddUint64(&s.next, 1) - 1) % uint64(n))
-		if s.healthy[idx].Load() {
-			return s.Backends[idx], idx, true
+		if list[idx].healthy.Load() {
+			return list[idx], true
 		}
 	}
-	return "", -1, false
+	return nil, false
 }
 
 // pickLeastConnections picks whichever healthy backend currently has the
@@ -457,25 +628,25 @@ func (s *Server) pickRoundRobin() (string, int, bool) {
 // ties, which are common when load is light or every backend is equally
 // fast, are broken fairly across backends instead of always favoring
 // whichever comes first in the list.
-func (s *Server) pickLeastConnections() (string, int, bool) {
-	n := len(s.Backends)
+func (s *Server) pickLeastConnections(list []*backendState) (*backendState, bool) {
+	n := len(list)
 	start := int((atomic.AddUint64(&s.next, 1) - 1) % uint64(n))
-	bestIdx := -1
+	var best *backendState
 	var bestCount int64
 	for i := 0; i < n; i++ {
-		idx := (start + i) % n
-		if !s.healthy[idx].Load() {
+		bs := list[(start+i)%n]
+		if !bs.healthy.Load() {
 			continue
 		}
-		count := atomic.LoadInt64(&s.active[idx])
-		if bestIdx == -1 || count < bestCount {
-			bestIdx, bestCount = idx, count
+		count := atomic.LoadInt64(&bs.active)
+		if best == nil || count < bestCount {
+			best, bestCount = bs, count
 		}
 	}
-	if bestIdx == -1 {
-		return "", -1, false
+	if best == nil {
+		return nil, false
 	}
-	return s.Backends[bestIdx], bestIdx, true
+	return best, true
 }
 
 // takeIdleConn returns a pooled, idle connection to addr if one is
@@ -509,22 +680,22 @@ func (s *Server) putIdleConn(addr string, conn net.Conn) {
 }
 
 func (s *Server) connectTimeout() time.Duration {
-	if s.ConnectTimeout > 0 {
-		return s.ConnectTimeout
+	if t := s.liveCfg().connectTimeout; t > 0 {
+		return t
 	}
 	return defaultConnectTimeout
 }
 
 func (s *Server) headerTimeout() time.Duration {
-	if s.HeaderTimeout > 0 {
-		return s.HeaderTimeout
+	if t := s.liveCfg().headerTimeout; t > 0 {
+		return t
 	}
 	return defaultHeaderTimeout
 }
 
 func (s *Server) responseTimeout() time.Duration {
-	if s.ResponseTimeout > 0 {
-		return s.ResponseTimeout
+	if t := s.liveCfg().responseTimeout; t > 0 {
+		return t
 	}
 	return defaultResponseTimeout
 }
@@ -581,12 +752,12 @@ func (s *Server) forwardOneRequest(client net.Conn, clientReader *bufio.Reader) 
 	client.SetReadDeadline(time.Time{})
 	atomic.AddInt64(&s.totalRequests, 1)
 
-	if s.MaxInFlight > 0 {
+	if maxInFlight := s.liveCfg().maxInFlight; maxInFlight > 0 {
 		current := atomic.AddInt64(&s.inFlight, 1)
-		if current > int64(s.MaxInFlight) {
+		if current > int64(maxInFlight) {
 			atomic.AddInt64(&s.inFlight, -1)
 			atomic.AddInt64(&s.totalRejected, 1)
-			log.Printf("relayforge: rejecting request, at capacity (%d in flight)", s.MaxInFlight)
+			log.Printf("relayforge: rejecting request, at capacity (%d in flight)", maxInFlight)
 			writeOverloadedResponse(client)
 			return false
 		}
@@ -724,41 +895,40 @@ func retryEligible(req *http.Request, a attempt) bool {
 // request as "in flight" for exactly as long as a backend is actually
 // doing something on its behalf.
 func (s *Server) attemptOnce(client net.Conn, clientReader *bufio.Reader, req *http.Request) attempt {
-	backendAddr, idx, ok := s.pickBackend()
+	bs, ok := s.pickBackend()
 	if !ok {
 		return attempt{err: errNoHealthyBackends}
 	}
-	atomic.AddInt64(&s.active[idx], 1)
-	defer atomic.AddInt64(&s.active[idx], -1)
+	atomic.AddInt64(&bs.active, 1)
+	defer atomic.AddInt64(&bs.active, -1)
 
-	stats := &s.backendStats[idx]
-	atomic.AddInt64(&stats.requests, 1)
+	atomic.AddInt64(&bs.stats.requests, 1)
 	start := time.Now()
 	recordDuration := func() {
-		atomic.AddInt64(&stats.durationNanosSum, int64(time.Since(start)))
-		atomic.AddInt64(&stats.durationCount, 1)
+		atomic.AddInt64(&bs.stats.durationNanosSum, int64(time.Since(start)))
+		atomic.AddInt64(&bs.stats.durationCount, 1)
 	}
 
-	backend := s.takeIdleConn(backendAddr)
+	backend := s.takeIdleConn(bs.addr)
 	reused := backend != nil
 	if backend == nil {
 		var err error
-		backend, err = net.DialTimeout("tcp", backendAddr, s.connectTimeout())
+		backend, err = net.DialTimeout("tcp", bs.addr, s.connectTimeout())
 		if err != nil {
 			recordDuration()
-			atomic.AddInt64(&stats.errors, 1)
-			return attempt{addr: backendAddr, dialed: false, err: err}
+			atomic.AddInt64(&bs.stats.errors, 1)
+			return attempt{addr: bs.addr, dialed: false, err: err}
 		}
 	}
 
 	resp, wroteFully, clientDisconnected, err := s.exchangeWithBackend(client, clientReader, backend, req)
 	recordDuration()
 	if err != nil {
-		atomic.AddInt64(&stats.errors, 1)
+		atomic.AddInt64(&bs.stats.errors, 1)
 		backend.Close()
-		return attempt{addr: backendAddr, dialed: true, reused: reused, wroteFully: wroteFully, clientDisconnected: clientDisconnected, err: err}
+		return attempt{addr: bs.addr, dialed: true, reused: reused, wroteFully: wroteFully, clientDisconnected: clientDisconnected, err: err}
 	}
-	return attempt{resp: resp, backend: backend, addr: backendAddr, dialed: true, reused: reused, wroteFully: true}
+	return attempt{resp: resp, backend: backend, addr: bs.addr, dialed: true, reused: reused, wroteFully: true}
 }
 
 // exchangeWithBackend writes req to backend and reads the matching

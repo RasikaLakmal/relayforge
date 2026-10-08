@@ -1706,3 +1706,249 @@ func TestMetricsReportsRejections(t *testing.T) {
 		t.Fatalf("metrics missing relayforge_rejected_total 1:\n%s", metrics)
 	}
 }
+
+// backendRequestCount reads how many requests have been recorded against
+// addr in srv's current backend list, for assertions about state carried
+// forward (or not) across a Reload. Returns -1 if addr isn't present.
+func backendRequestCount(srv *Server, addr string) int64 {
+	for _, bs := range srv.loadBackends() {
+		if bs.addr == addr {
+			return atomic.LoadInt64(&bs.stats.requests)
+		}
+	}
+	return -1
+}
+
+// TestReloadDoesNotDisturbInFlightRequest is the headline claim of this
+// milestone: a request already being forwarded to a backend keeps working
+// correctly even if Reload swaps out the entire backend list while it is
+// still in flight, because it holds its own reference to the backend it
+// is talking to, independent of whatever the current configuration looks
+// like by the time it finishes.
+func TestReloadDoesNotDisturbInFlightRequest(t *testing.T) {
+	slowLn := listenLoopback(t)
+	defer slowLn.Close()
+	go func() {
+		conn, req, err := acceptRealRequest(slowLn)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		io.Copy(io.Discard, req.Body)
+		time.Sleep(300 * time.Millisecond)
+		conn.Write([]byte(canned200("slow-finished")))
+	}()
+
+	otherLn := listenLoopback(t)
+	defer otherLn.Close()
+	rawHTTPBackend(t, otherLn, []string{canned200("other")})
+
+	ln := listenLoopback(t)
+	srv := &Server{Backends: []string{slowLn.Addr().String()}}
+	go srv.Serve(ln)
+	t.Cleanup(func() { ln.Close() })
+	proxyAddr := ln.Addr().String()
+
+	client, err := net.Dial("tcp", proxyAddr)
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer client.Close()
+	client.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if _, err := client.Write([]byte("GET / HTTP/1.1\r\nHost: test\r\n\r\n")); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+
+	// While that request is still in flight against the slow backend,
+	// reload to a completely different backend list.
+	time.Sleep(50 * time.Millisecond)
+	if err := srv.Reload(ReloadableConfig{Backends: []string{otherLn.Addr().String()}}); err != nil {
+		t.Fatalf("Reload: %v", err)
+	}
+
+	if got, want := readOneResponse(t, bufio.NewReader(client)), "slow-finished"; got != want {
+		t.Fatalf("body = %q, want %q (reload should not disturb an in-flight request)", got, want)
+	}
+
+	client2, err := net.Dial("tcp", proxyAddr)
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer client2.Close()
+	client2.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := client2.Write([]byte("GET / HTTP/1.1\r\nHost: test\r\n\r\n")); err != nil {
+		t.Fatalf("write request 2: %v", err)
+	}
+	if got, want := readOneResponse(t, bufio.NewReader(client2)), "other"; got != want {
+		t.Fatalf("body = %q, want %q (new requests should use the reloaded backend list)", got, want)
+	}
+}
+
+func TestReloadPreservesExistingBackendState(t *testing.T) {
+	backendLn := listenLoopback(t)
+	defer backendLn.Close()
+	rawHTTPBackend(t, backendLn, []string{canned200("one")})
+	addr := backendLn.Addr().String()
+
+	ln := listenLoopback(t)
+	srv := &Server{Backends: []string{addr}}
+	go srv.Serve(ln)
+	t.Cleanup(func() { ln.Close() })
+	proxyAddr := ln.Addr().String()
+
+	client, err := net.Dial("tcp", proxyAddr)
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	client.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := client.Write([]byte("GET / HTTP/1.1\r\nHost: test\r\n\r\n")); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+	if got, want := readOneResponse(t, bufio.NewReader(client)), "one"; got != want {
+		t.Fatalf("body = %q, want %q", got, want)
+	}
+	client.Close()
+
+	before := backendRequestCount(srv, addr)
+	if before <= 0 {
+		t.Fatalf("expected a positive recorded request count before reload, got %d", before)
+	}
+
+	if err := srv.Reload(ReloadableConfig{Backends: []string{addr}, MaxInFlight: 5}); err != nil {
+		t.Fatalf("Reload: %v", err)
+	}
+
+	after := backendRequestCount(srv, addr)
+	if after != before {
+		t.Fatalf("request count for an unchanged backend address was reset by reload: before=%d after=%d", before, after)
+	}
+}
+
+func TestReloadRejectsInvalidConfig(t *testing.T) {
+	backendLn := listenLoopback(t)
+	defer backendLn.Close()
+	rawHTTPBackend(t, backendLn, []string{canned200("ok")})
+	addr := backendLn.Addr().String()
+
+	ln := listenLoopback(t)
+	srv := &Server{Backends: []string{addr}}
+	go srv.Serve(ln)
+	t.Cleanup(func() { ln.Close() })
+
+	cases := []struct {
+		name string
+		cfg  ReloadableConfig
+	}{
+		{"empty backends", ReloadableConfig{}},
+		{"bad strategy", ReloadableConfig{Backends: []string{addr}, Strategy: "bogus"}},
+		{"duplicate backend", ReloadableConfig{Backends: []string{addr, addr}}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if err := srv.Reload(c.cfg); err == nil {
+				t.Fatalf("expected Reload to reject %s, got nil error", c.name)
+			}
+		})
+	}
+}
+
+func TestReloadChangesMaxInFlightLive(t *testing.T) {
+	backendLn := listenLoopback(t)
+	defer backendLn.Close()
+	go func() {
+		conn, req, err := acceptRealRequest(backendLn)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		io.Copy(io.Discard, req.Body)
+		time.Sleep(300 * time.Millisecond)
+		conn.Write([]byte(canned200("ok")))
+	}()
+	addr := backendLn.Addr().String()
+
+	ln := listenLoopback(t)
+	srv := &Server{Backends: []string{addr}} // MaxInFlight unbounded at first
+	go srv.Serve(ln)
+	t.Cleanup(func() { ln.Close() })
+	proxyAddr := ln.Addr().String()
+
+	// The listener is already bound before Serve's goroutine even starts
+	// (listenLoopback already did that), so a successful dial alone
+	// wouldn't guarantee Serve's own startup (storing the initial
+	// backend/config snapshots) has run yet. Give it a moment before
+	// reloading, otherwise Serve's belated startup store could clobber
+	// this Reload's.
+	time.Sleep(50 * time.Millisecond)
+
+	if err := srv.Reload(ReloadableConfig{Backends: []string{addr}, MaxInFlight: 1}); err != nil {
+		t.Fatalf("Reload: %v", err)
+	}
+
+	client1, err := net.Dial("tcp", proxyAddr)
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer client1.Close()
+	if _, err := client1.Write([]byte("GET / HTTP/1.1\r\nHost: test\r\n\r\n")); err != nil {
+		t.Fatalf("write request 1: %v", err)
+	}
+
+	time.Sleep(50 * time.Millisecond) // let request 1 occupy the one slot
+
+	client2, err := net.Dial("tcp", proxyAddr)
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer client2.Close()
+	if _, err := client2.Write([]byte("GET / HTTP/1.1\r\nHost: test\r\n\r\n")); err != nil {
+		t.Fatalf("write request 2: %v", err)
+	}
+	client2.SetReadDeadline(time.Now().Add(1 * time.Second))
+	resp, err := http.ReadResponse(bufio.NewReader(client2), &http.Request{Method: "GET"})
+	if err != nil {
+		t.Fatalf("read response 2: %v", err)
+	}
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("request 2 status = %d, want 503 (MaxInFlight=1 from reload should already be in effect)", resp.StatusCode)
+	}
+}
+
+// TestReloadChangesHealthCheckIntervalLive specifically exercises the
+// ticker.Reset fix in runHealthChecks: without it, a reload that shortens
+// HealthCheckInterval would have no effect until the next probe fires on
+// the OLD interval's schedule, here a full 10 seconds away.
+func TestReloadChangesHealthCheckIntervalLive(t *testing.T) {
+	deadLn := listenLoopback(t)
+	deadAddr := deadLn.Addr().String()
+	deadLn.Close()
+
+	ln := listenLoopback(t)
+	srv := &Server{
+		Backends:            []string{deadAddr},
+		HealthCheckInterval: 10 * time.Second,
+		HealthCheckTimeout:  50 * time.Millisecond,
+	}
+	go srv.Serve(ln)
+	t.Cleanup(func() { ln.Close() })
+
+	if err := srv.Reload(ReloadableConfig{
+		Backends:            []string{deadAddr},
+		HealthCheckInterval: 10 * time.Millisecond,
+		HealthCheckTimeout:  50 * time.Millisecond,
+	}); err != nil {
+		t.Fatalf("Reload: %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		list := srv.loadBackends()
+		if len(list) > 0 && !list[0].healthy.Load() {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("backend was not marked unhealthy after reload shortened the health check interval; ticker.Reset may not be taking effect")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}

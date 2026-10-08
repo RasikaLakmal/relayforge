@@ -28,24 +28,48 @@ func main() {
 	maxConnections := flag.Int("max-connections", 0, "maximum concurrent client connections, 0 means unbounded")
 	maxInFlight := flag.Int("max-in-flight", 0, "maximum concurrent in-flight requests across all backends, 0 means unbounded; a request past this is rejected with 503")
 	metricsListen := flag.String("metrics-listen", "", "address to serve Prometheus-style metrics on at /metrics, empty disables it")
+	configPath := flag.String("config", "", "path to a JSON config file; if set, every other flag is ignored and SIGHUP reloads backends/strategy/timeouts/max-in-flight from it without dropping traffic")
 	flag.Parse()
 
-	if *backendsFlag == "" {
-		log.Fatal("relayforge: -backends is required")
+	var cfg *resolvedConfig
+	if *configPath != "" {
+		loaded, err := loadAndValidateConfig(*configPath)
+		if err != nil {
+			log.Fatalf("relayforge: %v", err)
+		}
+		cfg = loaded
+	} else {
+		if *backendsFlag == "" {
+			log.Fatal("relayforge: -backends is required")
+		}
+		cfg = &resolvedConfig{
+			Listen:          *listenAddr,
+			Backends:        strings.Split(*backendsFlag, ","),
+			Strategy:        *strategy,
+			HealthInterval:  *healthInterval,
+			HealthTimeout:   *healthTimeout,
+			ConnectTimeout:  *connectTimeout,
+			HeaderTimeout:   *headerTimeout,
+			ResponseTimeout: *responseTimeout,
+			ShutdownTimeout: *shutdownTimeout,
+			MaxConnections:  *maxConnections,
+			MaxInFlight:     *maxInFlight,
+			MetricsListen:   *metricsListen,
+		}
 	}
 
 	srv := &proxy.Server{
-		ListenAddr:          *listenAddr,
-		Backends:            strings.Split(*backendsFlag, ","),
-		Strategy:            *strategy,
-		HealthCheckInterval: *healthInterval,
-		HealthCheckTimeout:  *healthTimeout,
-		ConnectTimeout:      *connectTimeout,
-		HeaderTimeout:       *headerTimeout,
-		ResponseTimeout:     *responseTimeout,
-		MaxConnections:      *maxConnections,
-		MaxInFlight:         *maxInFlight,
-		MetricsListenAddr:   *metricsListen,
+		ListenAddr:          cfg.Listen,
+		Backends:            cfg.Backends,
+		Strategy:            cfg.Strategy,
+		HealthCheckInterval: cfg.HealthInterval,
+		HealthCheckTimeout:  cfg.HealthTimeout,
+		ConnectTimeout:      cfg.ConnectTimeout,
+		HeaderTimeout:       cfg.HeaderTimeout,
+		ResponseTimeout:     cfg.ResponseTimeout,
+		MaxConnections:      cfg.MaxConnections,
+		MaxInFlight:         cfg.MaxInFlight,
+		MetricsListenAddr:   cfg.MetricsListen,
 	}
 
 	serveErr := make(chan error, 1)
@@ -54,21 +78,51 @@ func main() {
 	}()
 
 	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 
-	select {
-	case err := <-serveErr:
-		if err != nil && !errors.Is(err, proxy.ErrServerClosed) {
-			log.Fatalf("relayforge: %v", err)
-		}
-	case sig := <-sigCh:
-		log.Printf("relayforge: received %s, draining in-flight requests (up to %s)", sig, *shutdownTimeout)
-		ctx, cancel := context.WithTimeout(context.Background(), *shutdownTimeout)
-		defer cancel()
-		if err := srv.Shutdown(ctx); err != nil {
-			log.Printf("relayforge: shutdown timed out, forced remaining connections closed: %v", err)
-		} else {
-			log.Print("relayforge: shutdown complete, all connections drained")
+	for {
+		select {
+		case err := <-serveErr:
+			if err != nil && !errors.Is(err, proxy.ErrServerClosed) {
+				log.Fatalf("relayforge: %v", err)
+			}
+			return
+
+		case sig := <-sigCh:
+			if sig == syscall.SIGHUP {
+				if *configPath == "" {
+					log.Print("relayforge: received SIGHUP but no -config file was given, nothing to reload")
+					continue
+				}
+				reloaded, err := loadAndValidateConfig(*configPath)
+				if err != nil {
+					log.Printf("relayforge: reload failed, keeping existing configuration: %v", err)
+					continue
+				}
+				if err := srv.Reload(proxy.ReloadableConfig{
+					Backends:            reloaded.Backends,
+					Strategy:            reloaded.Strategy,
+					HealthCheckInterval: reloaded.HealthInterval,
+					HealthCheckTimeout:  reloaded.HealthTimeout,
+					ConnectTimeout:      reloaded.ConnectTimeout,
+					HeaderTimeout:       reloaded.HeaderTimeout,
+					ResponseTimeout:     reloaded.ResponseTimeout,
+					MaxInFlight:         reloaded.MaxInFlight,
+				}); err != nil {
+					log.Printf("relayforge: reload rejected: %v", err)
+				}
+				continue
+			}
+
+			log.Printf("relayforge: received %s, draining in-flight requests (up to %s)", sig, cfg.ShutdownTimeout)
+			ctx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
+			if err := srv.Shutdown(ctx); err != nil {
+				log.Printf("relayforge: shutdown timed out, forced remaining connections closed: %v", err)
+			} else {
+				log.Print("relayforge: shutdown complete, all connections drained")
+			}
+			cancel()
+			return
 		}
 	}
 }
