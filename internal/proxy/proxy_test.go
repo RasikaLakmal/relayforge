@@ -1380,3 +1380,140 @@ func TestShutdownStopsHealthCheckGoroutine(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 }
+
+// TestMaxInFlightRejectsOverCapacity is the failure experiment this
+// milestone is about: push more concurrent requests than the configured
+// limit against a backend too slow to drain them, and confirm the excess
+// gets a prompt, explicit 503 rather than piling up unboundedly or
+// hanging.
+func TestMaxInFlightRejectsOverCapacity(t *testing.T) {
+	backendLn := listenLoopback(t)
+	defer backendLn.Close()
+	var hits int64
+	delayedBackend(t, backendLn, 300*time.Millisecond, "ok", &hits)
+
+	ln := listenLoopback(t)
+	srv := &Server{
+		Backends:    []string{backendLn.Addr().String()},
+		MaxInFlight: 2,
+	}
+	go srv.Serve(ln)
+	t.Cleanup(func() { ln.Close() })
+	proxyAddr := ln.Addr().String()
+
+	const n = 6
+	statusCodes := make([]int, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			client, err := net.Dial("tcp", proxyAddr)
+			if err != nil {
+				return
+			}
+			defer client.Close()
+			client.SetReadDeadline(time.Now().Add(3 * time.Second))
+			if _, err := client.Write([]byte("GET / HTTP/1.1\r\nHost: test\r\n\r\n")); err != nil {
+				return
+			}
+			resp, err := http.ReadResponse(bufio.NewReader(client), &http.Request{Method: "GET"})
+			if err != nil {
+				return
+			}
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+			statusCodes[i] = resp.StatusCode
+		}(i)
+	}
+	wg.Wait()
+
+	var ok, rejected int
+	for _, code := range statusCodes {
+		switch code {
+		case http.StatusOK:
+			ok++
+		case http.StatusServiceUnavailable:
+			rejected++
+		}
+	}
+	if ok > 2 {
+		t.Fatalf("got %d successful requests, want at most MaxInFlight=2", ok)
+	}
+	if rejected == 0 {
+		t.Fatal("expected at least one request to be rejected with 503, got none")
+	}
+	if ok+rejected != n {
+		t.Fatalf("got %d ok + %d rejected = %d responses, want all %d accounted for", ok, rejected, ok+rejected, n)
+	}
+}
+
+// TestMaxConnectionsLimitsAcceptedConnections confirms the connection
+// cap gates actual request processing, not just raw TCP handshakes: a
+// connection attempted while already at capacity can still complete its
+// handshake (the kernel's own listen backlog doesn't know about our
+// limit), but gets no response until an existing connection closes and
+// frees a slot.
+func TestMaxConnectionsLimitsAcceptedConnections(t *testing.T) {
+	backendLn := listenLoopback(t)
+	defer backendLn.Close()
+	rawHTTPBackend(t, backendLn, []string{canned200("one"), canned200("two"), canned200("three")})
+
+	ln := listenLoopback(t)
+	srv := &Server{
+		Backends:       []string{backendLn.Addr().String()},
+		MaxConnections: 2,
+	}
+	go srv.Serve(ln)
+	t.Cleanup(func() { ln.Close() })
+	proxyAddr := ln.Addr().String()
+
+	conn1, err := net.Dial("tcp", proxyAddr)
+	if err != nil {
+		t.Fatalf("dial connection 1: %v", err)
+	}
+	defer conn1.Close()
+	conn2, err := net.Dial("tcp", proxyAddr)
+	if err != nil {
+		t.Fatalf("dial connection 2: %v", err)
+	}
+	defer conn2.Close()
+
+	// Give the accept loop a moment to actually accept both and fill its
+	// two connSem slots.
+	time.Sleep(50 * time.Millisecond)
+
+	conn3, err := net.DialTimeout("tcp", proxyAddr, 1*time.Second)
+	if err != nil {
+		t.Fatalf("dial connection 3: %v", err)
+	}
+	defer conn3.Close()
+	if _, err := conn3.Write([]byte("GET / HTTP/1.1\r\nHost: test\r\n\r\n")); err != nil {
+		t.Fatalf("write on connection 3: %v", err)
+	}
+
+	conn3.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+	buf := make([]byte, 16)
+	_, err = conn3.Read(buf)
+	netErr, isNetErr := err.(net.Error)
+	if !isNetErr || !netErr.Timeout() {
+		t.Fatalf("connection 3 got %v before any slot freed, want a read timeout (it should not have been accepted yet)", err)
+	}
+
+	// Free a slot; connection 3 should now get served.
+	conn1.Close()
+
+	conn3.SetReadDeadline(time.Now().Add(2 * time.Second))
+	resp, err := http.ReadResponse(bufio.NewReader(conn3), &http.Request{Method: "GET"})
+	if err != nil {
+		t.Fatalf("read response on connection 3 after a slot freed: %v", err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if got := string(body); got != "one" && got != "two" && got != "three" {
+		t.Fatalf("unexpected body %q", got)
+	}
+}

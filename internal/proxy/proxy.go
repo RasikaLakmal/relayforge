@@ -90,16 +90,36 @@ type Server struct {
 	// Zero uses defaultResponseTimeout.
 	ResponseTimeout time.Duration
 
-	next    uint64
-	healthy []atomic.Bool
-	active  []int64 // in-flight request count per backend, for least-connections
+	// MaxConnections bounds how many client connections may be open at
+	// once. Zero means unbounded. Once at capacity, Serve simply stops
+	// calling Accept until a connection closes and frees a slot, letting
+	// further connection attempts queue in the OS's own listen backlog
+	// and, once that backlog itself fills, get refused by the kernel,
+	// rather than this process accepting an unbounded number of sockets
+	// it has nowhere to put.
+	MaxConnections int
+	// MaxInFlight bounds how many requests may be concurrently in flight
+	// to backends at once, summed across every connection. Zero means
+	// unbounded. A request that arrives once this bound is already
+	// reached is rejected immediately with a 503 Service Unavailable
+	// response and the connection closed, rather than queued: a sized
+	// queue trades that predictability for burst tolerance at the cost
+	// of unbounded added latency if sized wrong, not a trade worth making
+	// without a real benchmark motivating it (milestone 11).
+	MaxInFlight int
+
+	next     uint64
+	healthy  []atomic.Bool
+	active   []int64 // in-flight request count per backend, for least-connections
+	inFlight int64   // in-flight request count across all backends, for MaxInFlight
 
 	idleMu sync.Mutex
 	idle   map[string][]net.Conn
 
-	closing          atomic.Bool
-	stopHealthChecks chan struct{}
-	connWG           sync.WaitGroup
+	closing    atomic.Bool
+	shutdownCh chan struct{}
+	connWG     sync.WaitGroup
+	connSem    chan struct{} // nil if MaxConnections <= 0
 
 	connsMu sync.Mutex
 	conns   map[net.Conn]struct{}
@@ -139,7 +159,10 @@ func (s *Server) Serve(ln net.Listener) error {
 	s.active = make([]int64, len(s.Backends))
 	s.idle = make(map[string][]net.Conn)
 	s.conns = make(map[net.Conn]struct{})
-	s.stopHealthChecks = make(chan struct{})
+	s.shutdownCh = make(chan struct{})
+	if s.MaxConnections > 0 {
+		s.connSem = make(chan struct{}, s.MaxConnections)
+	}
 
 	s.mu.Lock()
 	s.listener = ln
@@ -155,8 +178,19 @@ func (s *Server) Serve(ln net.Listener) error {
 	log.Printf("relayforge: listening on %s, backends=%v (%s)", ln.Addr(), s.Backends, strategy)
 
 	for {
+		if s.connSem != nil {
+			select {
+			case s.connSem <- struct{}{}:
+			case <-s.shutdownCh:
+				return ErrServerClosed
+			}
+		}
+
 		conn, err := ln.Accept()
 		if err != nil {
+			if s.connSem != nil {
+				<-s.connSem
+			}
 			if s.closing.Load() {
 				return ErrServerClosed
 			}
@@ -165,6 +199,9 @@ func (s *Server) Serve(ln net.Listener) error {
 		s.connWG.Add(1)
 		go func() {
 			defer s.connWG.Done()
+			if s.connSem != nil {
+				defer func() { <-s.connSem }()
+			}
 			s.handleConn(conn)
 		}()
 	}
@@ -182,7 +219,7 @@ func (s *Server) Serve(ln net.Listener) error {
 // anything, to do after that.
 func (s *Server) Shutdown(ctx context.Context) error {
 	s.closing.Store(true)
-	close(s.stopHealthChecks)
+	close(s.shutdownCh)
 
 	s.mu.Lock()
 	ln := s.listener
@@ -227,7 +264,7 @@ func (s *Server) closeIdleConns() {
 }
 
 // runHealthChecks probes every backend on a fixed interval until Shutdown
-// closes stopHealthChecks.
+// closes shutdownCh.
 func (s *Server) runHealthChecks() {
 	interval := s.HealthCheckInterval
 	if interval <= 0 {
@@ -239,7 +276,7 @@ func (s *Server) runHealthChecks() {
 		select {
 		case <-ticker.C:
 			s.probeAllBackends()
-		case <-s.stopHealthChecks:
+		case <-s.shutdownCh:
 			return
 		}
 	}
@@ -403,6 +440,21 @@ func (s *Server) handleConn(client net.Conn) {
 	}
 }
 
+// writeOverloadedResponse tells the client to back off: capacity is
+// explicitly full, not accidentally degraded, so this is a real 503 with
+// a hint of when to retry, not a silently dropped connection. The
+// connection is always closed afterward (Connection: close) rather than
+// kept alive for more requests that would just get rejected the same
+// way, and the request's own body, if any, is not drained first, a
+// deliberate simplification: this path exists for when the proxy is
+// already under more load than it can handle, reading more from an
+// already-rejected request isn't worth the complexity here.
+func writeOverloadedResponse(client net.Conn) {
+	body := "503 Service Unavailable: at capacity, try again shortly\n"
+	resp := fmt.Sprintf("HTTP/1.1 503 Service Unavailable\r\nContent-Length: %d\r\nRetry-After: 1\r\nConnection: close\r\n\r\n%s", len(body), body)
+	client.Write([]byte(resp))
+}
+
 // forwardOneRequest reads one HTTP request off the client and forwards it,
 // with up to one retry against a different backend for failures known not
 // to risk a duplicate side effect (see forwardWithRetry). It reports
@@ -414,6 +466,17 @@ func (s *Server) forwardOneRequest(client net.Conn, clientReader *bufio.Reader) 
 		return false
 	}
 	client.SetReadDeadline(time.Time{})
+
+	if s.MaxInFlight > 0 {
+		current := atomic.AddInt64(&s.inFlight, 1)
+		if current > int64(s.MaxInFlight) {
+			atomic.AddInt64(&s.inFlight, -1)
+			log.Printf("relayforge: rejecting request, at capacity (%d in flight)", s.MaxInFlight)
+			writeOverloadedResponse(client)
+			return false
+		}
+		defer atomic.AddInt64(&s.inFlight, -1)
+	}
 
 	a := s.forwardWithRetry(client, clientReader, req)
 	if a.err != nil {

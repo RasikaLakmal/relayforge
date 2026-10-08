@@ -25,6 +25,8 @@ func main() {
 	headerTimeout := flag.Duration("header-timeout", 10*time.Second, "how long a connection may wait for its next request, and how long that request has to finish once it starts arriving")
 	responseTimeout := flag.Duration("response-timeout", 30*time.Second, "how long the whole exchange with a backend (request write plus response read) may take")
 	shutdownTimeout := flag.Duration("shutdown-timeout", 10*time.Second, "how long to wait for in-flight requests to finish on shutdown before forcing connections closed")
+	maxConnections := flag.Int("max-connections", 0, "maximum concurrent client connections, 0 means unbounded")
+	maxInFlight := flag.Int("max-in-flight", 0, "maximum concurrent in-flight requests across all backends, 0 means unbounded; a request past this is rejected with 503")
 	flag.Parse()
 
 	if *backendsFlag == "" {
@@ -40,6 +42,8 @@ func main() {
 		ConnectTimeout:      *connectTimeout,
 		HeaderTimeout:       *headerTimeout,
 		ResponseTimeout:     *responseTimeout,
+		MaxConnections:      *maxConnections,
+		MaxInFlight:         *maxInFlight,
 	}
 
 	serveErr := make(chan error, 1)
