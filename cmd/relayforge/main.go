@@ -27,6 +27,7 @@ func main() {
 	shutdownTimeout := flag.Duration("shutdown-timeout", 10*time.Second, "how long to wait for in-flight requests to finish on shutdown before forcing connections closed")
 	maxConnections := flag.Int("max-connections", 0, "maximum concurrent client connections, 0 means unbounded")
 	maxInFlight := flag.Int("max-in-flight", 0, "maximum concurrent in-flight requests across all backends, 0 means unbounded; a request past this is rejected with 503")
+	metricsListen := flag.String("metrics-listen", "", "address to serve Prometheus-style metrics on at /metrics, empty disables it")
 	flag.Parse()
 
 	if *backendsFlag == "" {
@@ -44,6 +45,7 @@ func main() {
 		ResponseTimeout:     *responseTimeout,
 		MaxConnections:      *maxConnections,
 		MaxInFlight:         *maxInFlight,
+		MetricsListenAddr:   *metricsListen,
 	}
 
 	serveErr := make(chan error, 1)

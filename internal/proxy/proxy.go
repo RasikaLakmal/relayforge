@@ -15,6 +15,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -108,10 +109,22 @@ type Server struct {
 	// without a real benchmark motivating it (milestone 11).
 	MaxInFlight int
 
+	// MetricsListenAddr, if set, serves Prometheus-style text metrics at
+	// /metrics on this separate address for as long as the proxy runs.
+	// Empty disables it. A separate address rather than a path on the
+	// main listener, so a backend's own routes can never collide with it
+	// and metrics scraping is never mixed in with proxied traffic.
+	MetricsListenAddr string
+
 	next     uint64
 	healthy  []atomic.Bool
 	active   []int64 // in-flight request count per backend, for least-connections
 	inFlight int64   // in-flight request count across all backends, for MaxInFlight
+
+	backendStats  []backendStats
+	totalRequests int64
+	totalRetries  int64
+	totalRejected int64
 
 	idleMu sync.Mutex
 	idle   map[string][]net.Conn
@@ -120,12 +133,26 @@ type Server struct {
 	shutdownCh chan struct{}
 	connWG     sync.WaitGroup
 	connSem    chan struct{} // nil if MaxConnections <= 0
+	metricsSrv *http.Server
 
 	connsMu sync.Mutex
 	conns   map[net.Conn]struct{}
 
 	mu       sync.Mutex
 	listener net.Listener
+}
+
+// backendStats accumulates per-backend counters, all updated with atomics
+// so they can be read concurrently with ongoing requests without a lock.
+// durationNanosSum/durationCount together give an average latency, not a
+// real histogram with percentiles, a deliberate simplification: bucketed
+// histograms add real design complexity (choosing boundaries) that isn't
+// justified without a benchmark need yet.
+type backendStats struct {
+	requests         int64
+	errors           int64
+	durationNanosSum int64
+	durationCount    int64
 }
 
 // ListenAndServe opens ListenAddr and serves it until Accept fails.
@@ -157,6 +184,7 @@ func (s *Server) Serve(ln net.Listener) error {
 		s.healthy[i].Store(true)
 	}
 	s.active = make([]int64, len(s.Backends))
+	s.backendStats = make([]backendStats, len(s.Backends))
 	s.idle = make(map[string][]net.Conn)
 	s.conns = make(map[net.Conn]struct{})
 	s.shutdownCh = make(chan struct{})
@@ -170,6 +198,7 @@ func (s *Server) Serve(ln net.Listener) error {
 
 	go s.probeAllBackends()
 	go s.runHealthChecks()
+	s.startMetricsServer()
 
 	strategy := s.Strategy
 	if strategy == "" {
@@ -228,6 +257,9 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		ln.Close()
 	}
 	s.closeIdleConns()
+	if s.metricsSrv != nil {
+		s.metricsSrv.Close()
+	}
 
 	done := make(chan struct{})
 	go func() {
@@ -261,6 +293,87 @@ func (s *Server) closeIdleConns() {
 		}
 		delete(s.idle, addr)
 	}
+}
+
+// startMetricsServer starts the optional /metrics endpoint in the
+// background if MetricsListenAddr is set. A failure here (e.g. the
+// address is already in use) is logged, not fatal: metrics are a
+// secondary concern, not worth taking down request handling over.
+func (s *Server) startMetricsServer() {
+	if s.MetricsListenAddr == "" {
+		return
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/metrics", s.serveMetrics)
+	s.metricsSrv = &http.Server{Addr: s.MetricsListenAddr, Handler: mux}
+	go func() {
+		log.Printf("relayforge: metrics listening on %s/metrics", s.MetricsListenAddr)
+		if err := s.metricsSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Printf("relayforge: metrics server error: %v", err)
+		}
+	}()
+}
+
+// serveMetrics renders current counters and gauges in Prometheus text
+// exposition format, by hand rather than via a client library: the
+// format itself is simple line-based text, and the point of this project
+// is understanding what is actually being exposed, not wiring up a
+// registry.
+func (s *Server) serveMetrics(w http.ResponseWriter, r *http.Request) {
+	var b strings.Builder
+
+	b.WriteString("# HELP relayforge_requests_total Total requests received by the proxy.\n")
+	b.WriteString("# TYPE relayforge_requests_total counter\n")
+	fmt.Fprintf(&b, "relayforge_requests_total %d\n", atomic.LoadInt64(&s.totalRequests))
+
+	b.WriteString("# HELP relayforge_rejected_total Requests rejected for exceeding MaxInFlight.\n")
+	b.WriteString("# TYPE relayforge_rejected_total counter\n")
+	fmt.Fprintf(&b, "relayforge_rejected_total %d\n", atomic.LoadInt64(&s.totalRejected))
+
+	b.WriteString("# HELP relayforge_retries_total Requests retried against a different backend.\n")
+	b.WriteString("# TYPE relayforge_retries_total counter\n")
+	fmt.Fprintf(&b, "relayforge_retries_total %d\n", atomic.LoadInt64(&s.totalRetries))
+
+	b.WriteString("# HELP relayforge_active_connections Currently open client connections.\n")
+	b.WriteString("# TYPE relayforge_active_connections gauge\n")
+	s.connsMu.Lock()
+	activeConns := len(s.conns)
+	s.connsMu.Unlock()
+	fmt.Fprintf(&b, "relayforge_active_connections %d\n", activeConns)
+
+	b.WriteString("# HELP relayforge_in_flight_requests Requests currently being forwarded to a backend.\n")
+	b.WriteString("# TYPE relayforge_in_flight_requests gauge\n")
+	fmt.Fprintf(&b, "relayforge_in_flight_requests %d\n", atomic.LoadInt64(&s.inFlight))
+
+	b.WriteString("# HELP relayforge_backend_up Whether the backend passed its most recent health check.\n")
+	b.WriteString("# TYPE relayforge_backend_up gauge\n")
+	b.WriteString("# HELP relayforge_backend_requests_total Requests routed to this backend.\n")
+	b.WriteString("# TYPE relayforge_backend_requests_total counter\n")
+	b.WriteString("# HELP relayforge_backend_errors_total Requests to this backend that failed.\n")
+	b.WriteString("# TYPE relayforge_backend_errors_total counter\n")
+	b.WriteString("# HELP relayforge_backend_active_requests Requests currently in flight to this backend.\n")
+	b.WriteString("# TYPE relayforge_backend_active_requests gauge\n")
+	b.WriteString("# HELP relayforge_backend_request_duration_seconds_sum Total time spent on requests to this backend. Sum/count gives an average, there are no percentile buckets yet.\n")
+	b.WriteString("# TYPE relayforge_backend_request_duration_seconds_sum counter\n")
+	b.WriteString("# HELP relayforge_backend_request_duration_seconds_count Requests to this backend with a recorded duration.\n")
+	b.WriteString("# TYPE relayforge_backend_request_duration_seconds_count counter\n")
+	for i, addr := range s.Backends {
+		up := 0
+		if s.healthy[i].Load() {
+			up = 1
+		}
+		stats := &s.backendStats[i]
+		fmt.Fprintf(&b, "relayforge_backend_up{backend=%q} %d\n", addr, up)
+		fmt.Fprintf(&b, "relayforge_backend_requests_total{backend=%q} %d\n", addr, atomic.LoadInt64(&stats.requests))
+		fmt.Fprintf(&b, "relayforge_backend_errors_total{backend=%q} %d\n", addr, atomic.LoadInt64(&stats.errors))
+		fmt.Fprintf(&b, "relayforge_backend_active_requests{backend=%q} %d\n", addr, atomic.LoadInt64(&s.active[i]))
+		seconds := float64(atomic.LoadInt64(&stats.durationNanosSum)) / 1e9
+		fmt.Fprintf(&b, "relayforge_backend_request_duration_seconds_sum{backend=%q} %g\n", addr, seconds)
+		fmt.Fprintf(&b, "relayforge_backend_request_duration_seconds_count{backend=%q} %d\n", addr, atomic.LoadInt64(&stats.durationCount))
+	}
+
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+	w.Write([]byte(b.String()))
 }
 
 // runHealthChecks probes every backend on a fixed interval until Shutdown
@@ -466,11 +579,13 @@ func (s *Server) forwardOneRequest(client net.Conn, clientReader *bufio.Reader) 
 		return false
 	}
 	client.SetReadDeadline(time.Time{})
+	atomic.AddInt64(&s.totalRequests, 1)
 
 	if s.MaxInFlight > 0 {
 		current := atomic.AddInt64(&s.inFlight, 1)
 		if current > int64(s.MaxInFlight) {
 			atomic.AddInt64(&s.inFlight, -1)
+			atomic.AddInt64(&s.totalRejected, 1)
 			log.Printf("relayforge: rejecting request, at capacity (%d in flight)", s.MaxInFlight)
 			writeOverloadedResponse(client)
 			return false
@@ -572,6 +687,7 @@ func (s *Server) forwardWithRetry(client net.Conn, clientReader *bufio.Reader, r
 	if !retryEligible(req, first) {
 		return first
 	}
+	atomic.AddInt64(&s.totalRetries, 1)
 	log.Printf("relayforge: retrying request after backend %s failed: %v", first.addr, first.err)
 	return s.attemptOnce(client, clientReader, req)
 }
@@ -615,18 +731,30 @@ func (s *Server) attemptOnce(client net.Conn, clientReader *bufio.Reader, req *h
 	atomic.AddInt64(&s.active[idx], 1)
 	defer atomic.AddInt64(&s.active[idx], -1)
 
+	stats := &s.backendStats[idx]
+	atomic.AddInt64(&stats.requests, 1)
+	start := time.Now()
+	recordDuration := func() {
+		atomic.AddInt64(&stats.durationNanosSum, int64(time.Since(start)))
+		atomic.AddInt64(&stats.durationCount, 1)
+	}
+
 	backend := s.takeIdleConn(backendAddr)
 	reused := backend != nil
 	if backend == nil {
 		var err error
 		backend, err = net.DialTimeout("tcp", backendAddr, s.connectTimeout())
 		if err != nil {
+			recordDuration()
+			atomic.AddInt64(&stats.errors, 1)
 			return attempt{addr: backendAddr, dialed: false, err: err}
 		}
 	}
 
 	resp, wroteFully, clientDisconnected, err := s.exchangeWithBackend(client, clientReader, backend, req)
+	recordDuration()
 	if err != nil {
+		atomic.AddInt64(&stats.errors, 1)
 		backend.Close()
 		return attempt{addr: backendAddr, dialed: true, reused: reused, wroteFully: wroteFully, clientDisconnected: clientDisconnected, err: err}
 	}

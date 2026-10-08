@@ -1517,3 +1517,192 @@ func TestMaxConnectionsLimitsAcceptedConnections(t *testing.T) {
 		t.Fatalf("unexpected body %q", got)
 	}
 }
+
+// fetchMetrics fetches and returns the raw Prometheus-text body served at
+// /metrics on addr.
+func fetchMetrics(t *testing.T, addr string) string {
+	t.Helper()
+	resp, err := http.Get("http://" + addr + "/metrics")
+	if err != nil {
+		t.Fatalf("fetch metrics: %v", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read metrics body: %v", err)
+	}
+	return string(body)
+}
+
+// reserveAddr binds an ephemeral port, closes it immediately, and returns
+// the address so a caller can pass it to something else that will bind
+// its own listener there a moment later. Used here to hand MetricsListenAddr
+// a free port before the metrics http.Server binds it for real.
+func reserveAddr(t *testing.T) string {
+	t.Helper()
+	ln := listenLoopback(t)
+	addr := ln.Addr().String()
+	ln.Close()
+	return addr
+}
+
+func TestMetricsReportsRequestAndBackendCounts(t *testing.T) {
+	backendLn := listenLoopback(t)
+	defer backendLn.Close()
+	responses := make([]string, 3)
+	for i := range responses {
+		responses[i] = canned200("ok")
+	}
+	rawHTTPBackend(t, backendLn, responses)
+
+	metricsAddr := reserveAddr(t)
+
+	ln := listenLoopback(t)
+	srv := &Server{
+		Backends:          []string{backendLn.Addr().String()},
+		MetricsListenAddr: metricsAddr,
+	}
+	go srv.Serve(ln)
+	t.Cleanup(func() { ln.Close() })
+	proxyAddr := ln.Addr().String()
+	time.Sleep(50 * time.Millisecond) // let the metrics server actually bind
+
+	for i := 0; i < 3; i++ {
+		client, err := net.Dial("tcp", proxyAddr)
+		if err != nil {
+			t.Fatalf("dial proxy: %v", err)
+		}
+		client.SetReadDeadline(time.Now().Add(2 * time.Second))
+		if _, err := client.Write([]byte("GET / HTTP/1.1\r\nHost: test\r\n\r\n")); err != nil {
+			t.Fatalf("write request: %v", err)
+		}
+		readOneResponse(t, bufio.NewReader(client))
+		client.Close()
+	}
+
+	metrics := fetchMetrics(t, metricsAddr)
+	if !strings.Contains(metrics, "relayforge_requests_total 3\n") {
+		t.Fatalf("metrics missing relayforge_requests_total 3:\n%s", metrics)
+	}
+	wantRequests := fmt.Sprintf("relayforge_backend_requests_total{backend=%q} 3\n", backendLn.Addr().String())
+	if !strings.Contains(metrics, wantRequests) {
+		t.Fatalf("metrics missing %q:\n%s", wantRequests, metrics)
+	}
+	wantUp := fmt.Sprintf("relayforge_backend_up{backend=%q} 1\n", backendLn.Addr().String())
+	if !strings.Contains(metrics, wantUp) {
+		t.Fatalf("metrics missing %q:\n%s", wantUp, metrics)
+	}
+}
+
+func TestMetricsReportsRetries(t *testing.T) {
+	backend1Ln := listenLoopback(t)
+	defer backend1Ln.Close()
+	go func() {
+		conn, req, err := acceptRealRequest(backend1Ln)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		io.Copy(io.Discard, req.Body)
+		// Accept the request, then hang up without responding: the
+		// write succeeds, but the read never gets an answer, which
+		// makes this retry-eligible (idempotent GET).
+	}()
+
+	backend2Ln := listenLoopback(t)
+	defer backend2Ln.Close()
+	rawHTTPBackend(t, backend2Ln, []string{canned200("ok")})
+
+	metricsAddr := reserveAddr(t)
+
+	ln := listenLoopback(t)
+	srv := &Server{
+		Backends:          []string{backend1Ln.Addr().String(), backend2Ln.Addr().String()},
+		MetricsListenAddr: metricsAddr,
+	}
+	go srv.Serve(ln)
+	t.Cleanup(func() { ln.Close() })
+	proxyAddr := ln.Addr().String()
+	time.Sleep(50 * time.Millisecond)
+
+	client, err := net.Dial("tcp", proxyAddr)
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer client.Close()
+	client.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := client.Write([]byte("GET / HTTP/1.1\r\nHost: test\r\n\r\n")); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+	if got, want := readOneResponse(t, bufio.NewReader(client)), "ok"; got != want {
+		t.Fatalf("body = %q, want %q", got, want)
+	}
+
+	metrics := fetchMetrics(t, metricsAddr)
+	if !strings.Contains(metrics, "relayforge_retries_total 1\n") {
+		t.Fatalf("metrics missing relayforge_retries_total 1:\n%s", metrics)
+	}
+}
+
+func TestMetricsReportsRejections(t *testing.T) {
+	backendLn := listenLoopback(t)
+	defer backendLn.Close()
+	go func() {
+		conn, req, err := acceptRealRequest(backendLn)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		io.Copy(io.Discard, req.Body)
+		time.Sleep(300 * time.Millisecond)
+		conn.Write([]byte(canned200("ok")))
+	}()
+
+	metricsAddr := reserveAddr(t)
+
+	ln := listenLoopback(t)
+	srv := &Server{
+		Backends:          []string{backendLn.Addr().String()},
+		MetricsListenAddr: metricsAddr,
+		MaxInFlight:       1,
+	}
+	go srv.Serve(ln)
+	t.Cleanup(func() { ln.Close() })
+	proxyAddr := ln.Addr().String()
+	time.Sleep(50 * time.Millisecond)
+
+	client1, err := net.Dial("tcp", proxyAddr)
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer client1.Close()
+	if _, err := client1.Write([]byte("GET / HTTP/1.1\r\nHost: test\r\n\r\n")); err != nil {
+		t.Fatalf("write request 1: %v", err)
+	}
+
+	// Give request 1 a moment to actually occupy the single MaxInFlight
+	// slot before request 2 arrives.
+	time.Sleep(50 * time.Millisecond)
+
+	client2, err := net.Dial("tcp", proxyAddr)
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer client2.Close()
+	if _, err := client2.Write([]byte("GET / HTTP/1.1\r\nHost: test\r\n\r\n")); err != nil {
+		t.Fatalf("write request 2: %v", err)
+	}
+	client2.SetReadDeadline(time.Now().Add(1 * time.Second))
+	resp, err := http.ReadResponse(bufio.NewReader(client2), &http.Request{Method: "GET"})
+	if err != nil {
+		t.Fatalf("read response 2: %v", err)
+	}
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("request 2 status = %d, want 503", resp.StatusCode)
+	}
+
+	metrics := fetchMetrics(t, metricsAddr)
+	if !strings.Contains(metrics, "relayforge_rejected_total 1\n") {
+		t.Fatalf("metrics missing relayforge_rejected_total 1:\n%s", metrics)
+	}
+}
