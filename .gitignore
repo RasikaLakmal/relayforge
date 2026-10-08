@@ -1,3 +1,7 @@
 /relayforge
 /relayforge.exe
+/benchmarks/naive-proxy/naive-proxy
+/benchmarks/naive-proxy/naive-proxy.exe
+/benchmarks/loadgen/loadgen
+/benchmarks/loadgen/loadgen.exe
 *.log

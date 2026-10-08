@@ -1,6 +1,8 @@
 # RelayForge
 
-TCP reverse proxy and load balancer in Go, built from scratch to actually understand connection handling, HTTP framing, load balancing, connection pooling, and backpressure rather than configuring nginx/HAProxy/Traefik and trusting the magic.
+TCP/HTTP reverse proxy and load balancer in Go: connection pooling, health checks, retries, backpressure.
+
+Built from scratch to actually understand connection handling, HTTP framing, load balancing, connection pooling, and backpressure rather than configuring nginx/HAProxy/Traefik and trusting the magic.
 
 Part of a personal engineering lab of systems-depth projects.
 
@@ -19,6 +21,90 @@ Part of a personal engineering lab of systems-depth projects.
 - **Backpressure**: `-max-connections` bounds how many client connections may be open at once, accepting no further ones (letting them queue in the OS's own listen backlog instead) once at capacity. `-max-in-flight` separately bounds how many requests may be concurrently in flight to backends across all connections combined; a request past that limit gets an immediate, explicit 503 rather than being queued or silently left to pile up. Both are opt-in (zero means unbounded) since the right numbers depend on real capacity testing, not a guess.
 - **Metrics**: `-metrics-listen` serves hand-written Prometheus text format at `/metrics` on its own address, separate from proxied traffic so a backend's own routes can never collide with it. Covers aggregate request/retry/rejection counters, active connection and in-flight gauges, and per-backend request/error counts, health state, and average latency (a sum and count, not a real histogram with percentiles, that's a deliberate simplification until there's a reason for real buckets).
 - **Config file and reload**: `-config` points at a JSON file instead of individual flags, validated up front (malformed backend addresses, duplicate backends, an unrecognized strategy, a non-positive duration, a negative count all fail startup immediately with a clear error rather than starting up broken). On `SIGHUP`, the file is re-read, re-validated, and swapped into the running server without dropping any in-flight request: `Backends`, `Strategy`, the health-check settings, the timeouts, and `MaxInFlight` all take effect immediately; a backend address that is still present afterward keeps its existing health state and accumulated metrics rather than resetting. `ListenAddr`, `MetricsListenAddr`, and `MaxConnections` are not reloadable, changing where or how many connections are accepted needs a new listener, which is a restart, not a reload.
+
+## Architecture
+
+### Request path
+
+```
+client connects
+     │
+     ▼
+┌───────────────┐  http.ReadRequest,
+│ parse request │  framing-aware
+└───────────────┘  (Content-Length / chunked)
+     │
+     ▼
+┌───────────────┐  MaxInFlight check:
+│  backpressure │  over the limit? reject
+└───────────────┘  with 503, done
+     │ under the limit
+     ▼
+┌───────────────┐  round-robin or
+│ pick backend  │  least-connections,
+└───────────────┘  skips unhealthy ones
+     │
+     ▼
+┌───────────────┐  pooled connection if
+│get connection │  one is idle, else a
+└───────────────┘  fresh dial
+     │
+     ▼
+┌───────────────┐  write request, read
+│   exchange    │  response, watching for
+└───────────────┘  client disconnect throughout
+     │
+     ▼
+┌───────────────┐
+│write response │  back to the client
+└───────────────┘
+     │
+     ▼
+Connection: close on either side?
+     │
+     ├─ yes ──▶ close client + backend connections
+     │
+     └─ no  ──▶ pool the backend connection, loop
+                back for the next request on the
+                same client connection
+```
+
+### Health-check loop
+
+```
+every HealthCheckInterval (its own goroutine,
+independent of request handling):
+     │
+     ▼
+for each backend, concurrently:
+     │
+     ▼
+  plain TCP connect, bounded by
+  HealthCheckTimeout
+     │
+     ├─▶ succeeds → mark healthy
+     │              (logged only on change)
+     │
+     └─▶ fails    → mark unhealthy, excluded
+                     from selection until a
+                     later probe succeeds
+```
+
+### Load-balancing decision point
+
+```
+pickBackend()
+     │
+     ├─ strategy = round-robin ──────▶ cycle through backends
+     │                                 in order, skipping any
+     │                                 currently unhealthy one
+     │
+     └─ strategy = least-connections ──▶ scan healthy backends
+                                          from a rotating offset,
+                                          pick whichever has the
+                                          fewest in-flight requests
+                                          right now
+```
 
 ## Usage
 
@@ -64,6 +150,74 @@ go build -o relayforge ./cmd/relayforge
 
 If `-config` is set, every other flag is ignored, settings come entirely from the file. Every field is optional except `listen` and `backends`; anything else left out uses the same built-in default as its flag would. Sending `SIGHUP` re-reads and re-validates the file and reloads `backends`, `strategy`, the health-check settings, the timeouts, and `max_in_flight` into the running server without dropping any in-flight request; an invalid file at reload time is rejected and the server keeps running on its existing configuration rather than being torn down by a typo.
 
+## Benchmarks
+
+```sh
+go build -o relayforge ./cmd/relayforge
+go build -o benchmarks/naive-proxy/naive-proxy ./benchmarks/naive-proxy
+go build -o benchmarks/loadgen/loadgen ./benchmarks/loadgen
+```
+
+`benchmarks/naive-proxy` is a deliberately simple baseline: HTTP-aware, round-robin, but no connection pooling (a fresh backend dial per request), no health checks, and no retries, roughly what this project looked like after milestone 2. `benchmarks/loadgen` drives concurrent load against a target and reports throughput, latency percentiles, and an outcome breakdown; each worker opens its own fresh connection per request, matching what "N concurrent connections" means for a proxy that serves independent clients, not N persistent ones.
+
+All runs below are on one Windows machine over loopback, no network in the way, numbers are relative to each other on this machine, not portable to different hardware.
+
+### Pooling vs no pooling, under load
+
+| Concurrency | Proxy | Throughput | Failure rate | p50 | p95 | p99 |
+|---|---|---|---|---|---|---|
+| 100 | relayforge | 3034 req/s | 0% | 32ms | 50ms | 60ms |
+| 100 | naive-proxy | 764 req/s | 18% (431/2393) | 46ms | 280ms | 294ms |
+| 200 | relayforge | 2840 req/s | 0% | 67ms | 103ms | 116ms |
+| 200 | naive-proxy | 843 req/s | 41% (1175/2841) | 83ms | 708ms | 937ms |
+
+At both tiers relayforge is 3.4-4x the throughput of the naive baseline, with zero failures where naive-proxy is already failing a third to nearly half its requests. The naive proxy's failures are not timeouts or backend errors, they are real connection-establishment failures (`WSAEADDRINUSE`, "Only one usage of each socket address is normally permitted"): dialing a fresh backend connection for every single request churns through ephemeral ports faster than Windows can recycle them out of `TIME_WAIT`. This is exactly the problem milestone 4's connection pooling exists to solve, and the benchmark reproduces it directly rather than needing to take that on faith.
+
+### Where the test harness itself becomes the bottleneck
+
+Pushed to 500 concurrent workers, *both* proxies degraded to a similar, much worse throughput (993 req/s and 779 req/s respectively) with the large majority of requests failing. That similarity across two very differently-built proxies is itself the signal: at that point, `netstat` showed 16,284 connections in `TIME_WAIT`, almost exactly Windows' default ephemeral port range (~16,384 ports). The load generator's own fresh-connection-per-request model had exhausted the local port pool; the measurement had stopped being about either proxy and started being about the test machine. The backlog drained back to near zero in about 100 seconds (Windows' default `TIME_WAIT` duration) once load stopped.
+
+The honest scope of this benchmark, on this machine, is therefore: relayforge vs. the naive baseline is a clean, decisive comparison up to a few hundred concurrent connections, and 1000/5000/10000 were not run as additional tiers, since they would reproduce the same test-harness saturation already demonstrated at 500, not new information about either proxy. A real 5000-10000 concurrent connection benchmark needs either multiple load-generating machines/IPs (the standard real-world fix, spreading the ephemeral-port cost across more than one source address) or a tuned OS network stack, neither of which this lab's single dev machine has reason to set up just for this number.
+
+### Round robin vs least-connections, under uneven backend cost
+
+Two backends, one artificially slow (50ms per response), one fast, 50 concurrent workers, 3 seconds:
+
+| Strategy | Throughput | p50 | p95 | p99 |
+|---|---|---|---|---|
+| round-robin | 1680 req/s | 24ms | 60ms | 65ms |
+| least-connections | 2485 req/s | 15ms | 65ms | 70ms |
+
+Least-connections pushed 48% more throughput through the same two backends, by noticing the slow one still has requests in flight and favoring the fast one instead of blindly alternating. The very slightly worse p95/p99 is real, not noise, it comes from the slow backend still getting a share of requests (least-connections balances load, it does not avoid a backend entirely just for being slower), so the tail still includes some of those.
+
+### Failover time when a backend dies mid-request
+
+Two equal backends, round robin, a 200ms health-check interval, one request every 200ms, backend B killed between requests 10 and 11:
+
+```
+t=2849ms  req=9   code=200
+t=3198ms  req=10  code=200
+>>> killed backend-B at t=3198ms <<<
+t=3665ms  req=11  code=200   (467ms gap, vs ~350ms baseline)
+t=4015ms  req=12  code=200   (350ms gap, back to normal)
+```
+
+Every single request returned 200. Request 11, the first one to round-robin onto the now-dead backend, paid a small, mostly-hidden cost: a fast local connection refusal plus one transparent retry against the surviving backend, about 115ms over the baseline gap. Every request after that avoided the dead backend entirely, consistent with the 200ms health-check interval having already caught it. Retry (milestone 5) is what makes failover invisible to the client immediately; the health check (milestone 3) is what stops paying the retry cost on every subsequent request once it has had a chance to run. Neither one alone tells the whole story.
+
+### Overload behavior (milestone 8's backpressure, measured)
+
+`-max-in-flight 3`, a 500ms-slow backend, 10 concurrent requests:
+
+```
+200 200 200 503 503 503 503 503 503 503
+```
+
+Exactly 3 succeed, matching the configured limit; the other 7 get an immediate, explicit rejection rather than queueing or timing out. `-max-connections 5` under the same slow backend with 30 concurrent requests: all 30 complete successfully in about 3 seconds (30 ÷ 5 × 500ms), process memory and goroutine count stayed flat throughout (visible live via `/metrics`), nothing crashed or ran out of descriptors, the excess simply queued through the connection cap. The real question this answers isn't "how fast is relayforge," it's "what does relayforge do once demand exceeds capacity," and the answer here is: it fails predictably and explicitly, or queues within a hard bound, never silently.
+
+## Failure experiments
+
+[docs/failure-experiments.md](docs/failure-experiments.md): six deliberate ways relayforge was broken on purpose (a backend killed mid-request, the proxy itself force-killed mid-request, an artificially slow backend with retries confirmed not to cascade, malformed HTTP sent directly at the proxy, a connection/in-flight flood past the configured backpressure limits, and a client disconnecting mid-wait), all run against real processes with the actual numbers from those runs.
+
 ## Known limitations
 
 - `SIGHUP` is a POSIX signal with no real Windows OS equivalent; Go only wires actual console events (Ctrl+C-style) to `os.Interrupt` on Windows, not `SIGHUP`. The reload trigger is effectively untestable, and likely unusable, on Windows even though the code compiles there; it was verified directly via `Server.Reload` in Go tests instead of via a real delivered signal.
@@ -95,4 +249,4 @@ go test ./...
 
 Covers: a single request/response round trip through the proxy, a chunked response body reassembled correctly, two requests carried over one persistent connection, a connection torn down after a `Connection: close` response, a malformed request rejected cleanly instead of hanging the proxy, the client connection closed cleanly when a backend dial fails, requests round-robining across backends in the correct order over a single persistent connection, a dead backend getting routed around once health checks converge, a backend rejoining rotation after it recovers, every backend being unhealthy failing requests cleanly, health checks being periodic rather than catching a backend the instant it dies, a backend connection actually being reused across three separate client connections, a `Connection: close` response never being pooled, a stale pooled connection being retried transparently, a request with a body never being retried even on an otherwise-eligible stale connection, an idempotent request being retried against a different backend after one fails to respond, a non-idempotent request never being retried in that same situation, the connect timeout actually applying to a hanging dial, an idle connection past the header timeout being closed, a hanging backend failing after the response timeout, a client disconnecting mid-request cancelling the backend work with no goroutine leak, least-connections favoring a faster backend under a concurrent burst against a slower one, least-connections skipping an unhealthy backend, an unrecognized strategy being rejected at startup, shutdown refusing new connections immediately, an in-flight request finishing successfully during shutdown before its now-idle connection closes, a stuck request being force-closed once the shutdown deadline passes, the health-check goroutine actually stopping after shutdown instead of leaking, a burst of requests past `-max-in-flight` getting 503s for the excess while the rest succeed, a connection attempted past `-max-connections` getting no response until an existing one closes and frees a slot, the metrics endpoint reporting accurate aggregate and per-backend request counts, a retry showing up in `relayforge_retries_total`, a rejection showing up in `relayforge_rejected_total`, a reload not disturbing a request already in flight, a reload preserving an unchanged backend's accumulated state, invalid reload configuration being rejected, `max_in_flight` taking effect immediately after a reload, and a shortened health-check interval taking effect immediately after a reload rather than waiting for the old interval's own schedule. `cmd/relayforge` has its own tests for config file loading and validation: a valid file resolves correctly, a missing file and malformed JSON are both rejected, and each individual validation rule (bad backend address, duplicate backend, bad strategy, bad or non-positive duration, negative counts) is rejected on its own.
 
-A separate benchmark comparing round robin against least-connections under uneven backend cost, with real numbers instead of the qualitative demonstration above, belongs in milestone 11.
+`go test -race ./...` still could not be run in this environment specifically (no C compiler, same limitation noted throughout this project), the goroutine-leak, stale-pooled-connection, and concurrent-load tests above are the next best thing available here: they exercise the exact scenarios a race would need to reproduce (concurrent health state mutation, concurrent active-connection counters, concurrent reload against in-flight requests), just without the race detector's own instrumentation confirming it. Running `go test -race ./...` on a machine with a C toolchain available is the one item from this milestone's deliverables genuinely left undone here.

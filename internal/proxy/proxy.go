@@ -15,6 +15,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -485,6 +486,16 @@ func (s *Server) serveMetrics(w http.ResponseWriter, r *http.Request) {
 	b.WriteString("# HELP relayforge_in_flight_requests Requests currently being forwarded to a backend.\n")
 	b.WriteString("# TYPE relayforge_in_flight_requests gauge\n")
 	fmt.Fprintf(&b, "relayforge_in_flight_requests %d\n", atomic.LoadInt64(&s.inFlight))
+
+	b.WriteString("# HELP relayforge_goroutines Current goroutine count for the whole process, a direct signal of per-connection/per-request leaks.\n")
+	b.WriteString("# TYPE relayforge_goroutines gauge\n")
+	fmt.Fprintf(&b, "relayforge_goroutines %d\n", runtime.NumGoroutine())
+
+	var mem runtime.MemStats
+	runtime.ReadMemStats(&mem)
+	b.WriteString("# HELP relayforge_memory_bytes Current heap memory in use (runtime.MemStats.Alloc) for the whole process.\n")
+	b.WriteString("# TYPE relayforge_memory_bytes gauge\n")
+	fmt.Fprintf(&b, "relayforge_memory_bytes %d\n", mem.Alloc)
 
 	b.WriteString("# HELP relayforge_backend_up Whether the backend passed its most recent health check.\n")
 	b.WriteString("# TYPE relayforge_backend_up gauge\n")
